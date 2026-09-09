@@ -1,7 +1,7 @@
-"""FastAPI middleware that enforces peer-token auth on federation endpoints.
+"""FastAPI middleware that enforces peer-token auth on cross-node endpoints.
 
-Applied only to paths under /api/v1/federation/ when peer tokens are configured.
-Non-federation paths pass through without auth checks.
+Protects federation endpoints and real cross-node traffic (tasks, sync, node join/heartbeat)
+when peer tokens are configured. Other paths pass through without auth checks.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ logger = logging.getLogger("hermes_cluster.auth_middleware")
 
 
 class PeerAuthMiddleware(BaseHTTPMiddleware):
-    """Verify peer-token HMAC-SHA256 signature on federation endpoints."""
+    """Verify peer-token HMAC-SHA256 signature on cross-node endpoints."""
 
     def __init__(self, app, enabled: bool = False):
         super().__init__(app)
@@ -29,8 +29,23 @@ class PeerAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
         path = request.url.path
 
-        # Only protect federation endpoints
-        if not self.enabled or not path.startswith("/api/v1/federation/"):
+        # Protect federation endpoints + real cross-node traffic (D2 fix)
+        # - /api/v1/federation/* (federation management)
+        # - /api/v1/tasks* (task submission/claim/complete)
+        # - /api/v1/sync/* (cross-node sync)
+        # - /api/v1/nodes/join, /api/v1/nodes/heartbeat (node registration)
+        if not self.enabled:
+            return await call_next(request)
+
+        requires_auth = (
+            path.startswith("/api/v1/federation/")
+            or path.startswith("/api/v1/tasks")
+            or path.startswith("/api/v1/sync/")
+            or path == "/api/v1/nodes/join"
+            or path == "/api/v1/nodes/heartbeat"
+        )
+
+        if not requires_auth:
             return await call_next(request)
 
         # Read body for signature verification

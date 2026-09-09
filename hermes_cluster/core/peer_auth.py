@@ -131,7 +131,14 @@ def verify_request(
         hashlib.sha256,
     ).hexdigest()
 
-    if not hmac.compare_digest(expected, signature):
-        return False, "signature mismatch"
+    # Compare as bytes to handle non-ASCII signatures safely (D1 fix)
+    try:
+        sig_bytes = signature.encode("latin-1")
+        exp_bytes = expected.encode("ascii")
+        if not hmac.compare_digest(exp_bytes, sig_bytes):
+            return False, "signature mismatch"
+    except (UnicodeDecodeError, UnicodeEncodeError, TypeError):
+        # Non-hex or non-ASCII signature → malformed, reject cleanly
+        return False, "malformed signature"
 
     return True, ""
