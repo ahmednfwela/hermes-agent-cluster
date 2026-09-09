@@ -15,6 +15,7 @@ from .visualization import router as visualization_router
 from .setup import router as setup_router
 
 from .cluster import router as cluster_router
+from .intake import router as intake_router
 
 __all__ = [
     "nodes_router",
@@ -31,4 +32,5 @@ __all__ = [
     "visualization_router",
     "setup_router",
     "cluster_router",
+    "intake_router",
 ]
