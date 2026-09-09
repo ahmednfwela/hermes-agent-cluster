@@ -171,7 +171,13 @@ async def save_setup_config(req: SetupConfigRequest):
 
 @router.post("/test-connection")
 async def test_connection(req: TestConnectionRequest):
-    """POST /api/v1/setup/test-connection — test worker→main connectivity."""
+    """POST /api/v1/setup/test-connection — test worker→main connectivity.
+
+    bdaya-defer:(shared/claude-plugins#804) — does NOT sign outgoing request
+    via peer_auth. With peer auth ON, the target cluster returns 401 and the
+    test always fails. Fix: sign via peer_auth.sign_request() when configured
+    (same pattern as dashboard/plugin_api.py:_proxy).
+    """
     from urllib.request import Request, urlopen
 
     endpoint = req.endpoint.rstrip("/")
@@ -180,6 +186,7 @@ async def test_connection(req: TestConnectionRequest):
     try:
         http_req = Request(url, method="GET")
         http_req.add_header("Accept", "application/json")
+        # bdaya-defer:(shared/claude-plugins#804) — no peer-auth signing here.
         with urlopen(http_req, timeout=5) as resp:
             data = json.loads(resp.read().decode())
             return {

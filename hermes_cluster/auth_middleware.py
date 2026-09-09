@@ -33,6 +33,9 @@ PUBLIC_PATHS: FrozenSet[str] = frozenset({
     "/docs",
     "/redoc",
     "/openapi.json",
+    # GitLab webhook — has its own X-Gitlab-Token auth (PR#2).
+    # GitLab (external) can never sign peer-HMAC, so this MUST be public.
+    "/api/v1/intake/gitlab/webhook",
 })
 
 PUBLIC_PREFIXES: tuple = (

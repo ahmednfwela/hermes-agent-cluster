@@ -10,6 +10,7 @@ Endpoints:
 
 from __future__ import annotations
 
+import copy
 import os
 import signal
 import sys
@@ -111,7 +112,10 @@ async def get_config(defaults: bool = Query(False, description="Return default c
         cfg = ConfigJSON().model_dump()
     else:
         cfg = _current_config()
-    # H1: redact sensitive token fields
+    # N3a: deep-copy before redaction — _redact_tokens mutates in place,
+    # and _current_config() returns the LIVE store dict. Without copy, a
+    # GET would permanently overwrite tokens with "***REDACTED***" (N3b).
+    cfg = copy.deepcopy(cfg)
     _redact_tokens(cfg)
     return cfg
 
@@ -178,10 +182,15 @@ async def validate_config(cfg: Optional[ConfigJSON] = None):
     errors = _validate_config(config_dict)
     valid = len(errors) == 0
 
+    # N3c: redact tokens from the echoed config — validate previously
+    # returned the live config raw, leaking tokens to any authenticated peer.
+    config_echo = copy.deepcopy(config_dict)
+    _redact_tokens(config_echo)
+
     return {
         "valid": valid,
         "errors": errors,
-        "config": config_dict,
+        "config": config_echo,
     }
 
 
@@ -195,6 +204,8 @@ async def get_config_yaml(defaults: bool = Query(False, description="Return defa
         cfg = ConfigJSON().model_dump()
     else:
         cfg = _current_config()
+    # N3a: deep-copy before redaction (same fix as GET /config)
+    cfg = copy.deepcopy(cfg)
     _redact_tokens(cfg)
 
     yaml_str = _config_to_yaml(cfg)

@@ -641,3 +641,165 @@ class TestCrossNodeProtection:
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             resp = await client.post("/api/v1/tasks", content=body, headers=headers)
             assert resp.status_code == 200
+
+
+class TestWebhookPublicWithAuthOn:
+    """Webhook must work with peer auth ON — it has its own X-Gitlab-Token auth.
+
+    GitLab (external) can never sign peer-HMAC, so the webhook path is in the
+    PUBLIC set. Its auth is the X-Gitlab-Token header (from PR#2).
+    """
+
+    @pytest.fixture
+    def app_with_auth_and_webhook_secret(self):
+        os.environ["PEER_TOKEN"] = "local_secret"
+        os.environ["PEER_TOKENS"] = "peer_node:peer_secret"
+        os.environ["GITLAB_INTAKE_WEBHOOK_SECRET"] = "webhook_secret_xyz"
+        peer_auth.configure(
+            local_node_id="local_node",
+            local_token="local_secret",
+            peer_tokens={"peer_node": "peer_secret"},
+        )
+        app = create_app(cluster_id="test", node_id="local_node", node_role="main")
+        yield app
+        os.environ.pop("PEER_TOKEN", None)
+        os.environ.pop("PEER_TOKENS", None)
+        os.environ.pop("GITLAB_INTAKE_WEBHOOK_SECRET", None)
+
+    @pytest.mark.asyncio
+    async def test_webhook_passes_peer_auth_with_correct_gitlab_token(self, app_with_auth_and_webhook_secret):
+        """Correct X-Gitlab-Token → webhook reaches handler (not 401 from peer-auth)."""
+        transport = ASGITransport(app=app_with_auth_and_webhook_secret)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            # Non-issue event → ignored by handler, but NOT 401 from peer-auth
+            resp = await client.post(
+                "/api/v1/intake/gitlab/webhook",
+                json={"object_kind": "push"},
+                headers={"X-Gitlab-Token": "webhook_secret_xyz"},
+            )
+            # Handler returns 200 with "ignored" — NOT 401
+            assert resp.status_code == 200
+            assert resp.json()["status"] == "ignored"
+
+    @pytest.mark.asyncio
+    async def test_webhook_rejects_wrong_gitlab_token(self, app_with_auth_and_webhook_secret):
+        """Wrong X-Gitlab-Token → 401 from the intake handler's own auth check."""
+        transport = ASGITransport(app=app_with_auth_and_webhook_secret)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                "/api/v1/intake/gitlab/webhook",
+                json={"object_kind": "issue"},
+                headers={"X-Gitlab-Token": "wrong_token"},
+            )
+            assert resp.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_webhook_rejects_missing_gitlab_token(self, app_with_auth_and_webhook_secret):
+        """Missing X-Gitlab-Token → 401 from the intake handler's own auth check."""
+        transport = ASGITransport(app=app_with_auth_and_webhook_secret)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                "/api/v1/intake/gitlab/webhook",
+                json={"object_kind": "issue"},
+            )
+            assert resp.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_webhook_creates_task_with_valid_token(self, app_with_auth_and_webhook_secret):
+        """Correct token + valid issue payload → task created (proves full round-trip)."""
+        transport = ASGITransport(app=app_with_auth_and_webhook_secret)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                "/api/v1/intake/gitlab/webhook",
+                json={
+                    "object_kind": "issue",
+                    "object_attributes": {
+                        "iid": 999,
+                        "action": "open",
+                        "title": "Test webhook task",
+                    },
+                    "labels": [{"title": "tooling"}],
+                },
+                headers={"X-Gitlab-Token": "webhook_secret_xyz"},
+            )
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["status"] == "created"
+            assert "task_id" in data
+
+
+class TestConfigDeepCopyNoMutation:
+    """N3a/N3b: GET /api/v1/config must NOT mutate the live store via redaction."""
+
+    @pytest.mark.asyncio
+    async def test_get_config_does_not_corrupt_store(self):
+        """After GET /api/v1/config, the store still holds the real token."""
+        os.environ.pop("PEER_TOKEN", None)
+        os.environ.pop("PEER_TOKENS", None)
+        app = create_app(cluster_id="test", node_id="local_node", node_role="main")
+        sentinel = "sentinel_deep_copy_test_abc123"
+        from hermes_cluster.routers import config as config_mod
+        cfg = config_mod._current_config()
+        cfg["cluster"]["token"] = sentinel
+        if config_mod._store:
+            config_mod._store.set_config(cfg)
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            # First GET — redacts in response
+            resp1 = await client.get("/api/v1/config")
+            assert resp1.status_code == 200
+            assert sentinel not in json.dumps(resp1.json())
+
+            # Store must STILL hold the real sentinel (not ***REDACTED***)
+            live = config_mod._current_config()
+            assert live["cluster"]["token"] == sentinel, \
+                "GET /api/v1/config mutated the live store — N3a regression"
+
+            # Second GET — still redacted (not double-redacted)
+            resp2 = await client.get("/api/v1/config")
+            assert resp2.json()["cluster"]["token"] == "***REDACTED***"
+
+    @pytest.mark.asyncio
+    async def test_validate_does_not_leak_token(self):
+        """POST /api/v1/config/validate (no body) must NOT echo raw tokens."""
+        os.environ.pop("PEER_TOKEN", None)
+        os.environ.pop("PEER_TOKENS", None)
+        app = create_app(cluster_id="test", node_id="local_node", node_role="main")
+        sentinel = "sentinel_validate_leak_def456"
+        from hermes_cluster.routers import config as config_mod
+        cfg = config_mod._current_config()
+        cfg["cluster"]["token"] = sentinel
+        if config_mod._store:
+            config_mod._store.set_config(cfg)
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post("/api/v1/config/validate")
+            assert resp.status_code == 200
+            resp_text = json.dumps(resp.json())
+            assert sentinel not in resp_text, \
+                f"POST /config/validate leaked sentinel: {resp_text[:200]}"
+            # Config echo must be redacted
+            assert resp.json()["config"]["cluster"]["token"] == "***REDACTED***"
+
+    @pytest.mark.asyncio
+    async def test_federation_token_also_redacted(self):
+        """federation.token is also a sensitive field — must be redacted."""
+        os.environ.pop("PEER_TOKEN", None)
+        os.environ.pop("PEER_TOKENS", None)
+        app = create_app(cluster_id="test", node_id="local_node", node_role="main")
+        sentinel = "sentinel_federation_token_ghi789"
+        from hermes_cluster.routers import config as config_mod
+        cfg = config_mod._current_config()
+        cfg.setdefault("federation", {})["token"] = sentinel
+        if config_mod._store:
+            config_mod._store.set_config(cfg)
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.get("/api/v1/config")
+            assert resp.status_code == 200
+            resp_text = json.dumps(resp.json())
+            assert sentinel not in resp_text, \
+                f"federation.token leaked in GET /config: {resp_text[:200]}"
