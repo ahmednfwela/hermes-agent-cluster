@@ -163,7 +163,8 @@ All endpoints prefixed: `/api/v1`
 | `POST` | `/tasks` | Submit new task |
 | `GET` | `/tasks` | List all tasks |
 | `POST` | `/tasks/{id}/complete` | Mark task completed |
-| `POST` | `/tasks/{id}/fail` | Mark task failed (auto-block downstream) |
+| `POST` | `/tasks/{id}/fail` | Mark task failed (cascade-cancel downstream) |
+| `POST` | `/tasks/{id}/cancel` | Cancel task (two-phase for running tasks) |
 | `POST` | `/tasks/{id}/unblock` | Manually unblock task |
 | `POST` | `/tasks/{id}/advance` | Manually advance workflow |
 | `POST` | `/tasks/{id}/dependencies` | Set task dependencies |
@@ -175,6 +176,8 @@ All endpoints prefixed: `/api/v1`
 | `GET` | `/tasks/{id}/dependents` | Get downstream tasks depending on this task |
 | `GET` | `/tasks/{id}/trigger-chain` | Get trigger chain |
 | `GET` | `/workflow/graph` | Get workflow dependency graph |
+
+**Task States:** `pending`, `ready`, `assigned`, `running`, `completed`, `failed`, `blocked`, `cancel_requested`, `cancelled`
 
 #### Lease Management
 
@@ -474,7 +477,8 @@ telemetry:
 | `POST` | `/tasks` | 提交新任务 |
 | `GET` | `/tasks` | 列出所有任务 |
 | `POST` | `/tasks/{id}/complete` | 标记任务完成 |
-| `POST` | `/tasks/{id}/fail` | 标记任务失败（自动阻塞下游任务） |
+| `POST` | `/tasks/{id}/fail` | 标记任务失败（级联取消下游任务） |
+| `POST` | `/tasks/{id}/cancel` | 取消任务（运行中任务两阶段取消） |
 | `POST` | `/tasks/{id}/unblock` | 手动解除任务阻塞 |
 | `POST` | `/tasks/{id}/advance` | 手动推进工作流 |
 | `POST` | `/tasks/{id}/dependencies` | 设置任务依赖 |

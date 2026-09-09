@@ -192,10 +192,31 @@ class ClusterState:
             return list(self._tasks.values())
 
     def set_task_status(self, task_id: str, status: TaskStatus, fail_reason: str = "") -> bool:
+        """Set task status. Returns True on success.
+
+        Terminal-state invariant (B1 fix): completed/failed/cancelled/cancel_requested
+        are terminal — once a task reaches one of these states, it cannot transition
+        back to a non-terminal state (except cancel_requested → cancelled, which is
+        the worker-acknowledgement path in the two-phase cancel protocol).
+        """
         with self._tasks_lock:
             if task_id not in self._tasks:
                 return False
             task = self._tasks[task_id]
+            # Terminal states (B1): enforce terminality. The only allowed transition
+            # FROM a terminal state is cancel_requested → cancelled (worker ack).
+            _terminal = {
+                TaskStatus.completed,
+                TaskStatus.failed,
+                TaskStatus.cancelled,
+                TaskStatus.cancel_requested,
+            }
+            if task.status in _terminal:
+                # Allow the two-phase cancel ack: cancel_requested → cancelled
+                if task.status == TaskStatus.cancel_requested and status == TaskStatus.cancelled:
+                    pass  # allow transition
+                else:
+                    return False  # reject transition to non-terminal
             task.status = status
             task.updated_at = datetime.utcnow()
             task.version += 1
@@ -208,12 +229,21 @@ class ClusterState:
 
         This is the proper way to unassign a task — it avoids the race
         condition of separate set_task_status + direct attribute access.
-        Returns True if the task existed.
+        Returns True if the task existed and was not terminal (B1).
         """
         with self._tasks_lock:
             if task_id not in self._tasks:
                 return False
             task = self._tasks[task_id]
+            # Terminal-state guard (B1): do not revive a terminal task
+            _terminal = {
+                TaskStatus.completed,
+                TaskStatus.failed,
+                TaskStatus.cancelled,
+                TaskStatus.cancel_requested,
+            }
+            if task.status in _terminal:
+                return False
             task.assigned_to = None
             task.status = TaskStatus.ready
             task.updated_at = datetime.utcnow()
@@ -287,6 +317,7 @@ class ClusterState:
         counts = {
             "total": 0, "ready": 0, "running": 0,
             "completed": 0, "failed": 0, "pending": 0,
+            "blocked": 0, "cancel_requested": 0, "cancelled": 0,
         }
         with self._tasks_lock:
             for task in self._tasks.values():
@@ -380,32 +411,58 @@ class ClusterState:
     # -----------------------------------------------------------------------
 
     def handle_sync_message(self, msg: SyncMessage) -> bool:
-        """Apply a sync message. Returns True if applied."""
+        """Apply a sync message. Returns True if applied.
+
+        N1 fix: existing-task branch routes status writes through set_task_status
+        (inherits terminality guard) and gates on per-task version, not only the
+        global sync counter. This prevents a stale remote from reviving a terminal task.
+        """
         with self._sync_lock:
             if msg.version <= self._sync_version:
                 return False
             self._sync_version = msg.version
 
-        # Apply task state if present
-        if msg.task_state:
+        if not msg.task_state:
+            return True
+
+        task_id = msg.task_state.task_id
+        valid_statuses = [s.value for s in TaskStatus]
+
+        with self._tasks_lock:
+            if task_id not in self._tasks:
+                # Create new task from sync (no terminality concern for new tasks)
+                status = TaskStatus(msg.task_state.status) if msg.task_state.status in valid_statuses else TaskStatus.pending
+                self._tasks[task_id] = Task(
+                    id=task_id,
+                    title=msg.task_state.title,
+                    status=status,
+                    assigned_to=msg.task_state.assigned_to,
+                    version=msg.task_state.version,
+                )
+                return True
+
+            # Existing task: N1 fix — gate on per-task version
+            task = self._tasks[task_id]
+            if msg.task_state.version <= task.version:
+                return True  # stale task data; global counter already advanced
+
+            # Parse the incoming status
+            if msg.task_state.status not in valid_statuses:
+                return True  # unknown status value, skip
+
+            new_status = TaskStatus(msg.task_state.status)
+
+        # Release _tasks_lock before calling set_task_status (it acquires it internally)
+        # N1 fix: route through set_task_status to inherit terminality guard
+        accepted = self.set_task_status(task_id, new_status)
+        if accepted:
             with self._tasks_lock:
-                task_id = msg.task_state.task_id
-                if task_id in self._tasks:
-                    task = self._tasks[task_id]
-                    task.status = TaskStatus(msg.task_state.status) if msg.task_state.status in TaskStatus.__members__.values() else task.status
-                    if msg.task_state.assigned_to:
-                        task.assigned_to = msg.task_state.assigned_to
-                    task.version = msg.task_state.version
-                    task.updated_at = datetime.utcnow()
-                else:
-                    # Create new task from sync
-                    self._tasks[task_id] = Task(
-                        id=task_id,
-                        title=msg.task_state.title,
-                        status=TaskStatus(msg.task_state.status) if msg.task_state.status in TaskStatus.__members__.values() else TaskStatus.pending,
-                        assigned_to=msg.task_state.assigned_to,
-                        version=msg.task_state.version,
-                    )
+                t = self._tasks[task_id]
+                if msg.task_state.assigned_to:
+                    t.assigned_to = msg.task_state.assigned_to
+                # Ensure version tracks the sync (set_task_status already bumped it)
+                if msg.task_state.version > t.version:
+                    t.version = msg.task_state.version
         return True
 
     def handle_batch_sync(self, batch: BatchSyncMessage) -> int:
@@ -515,8 +572,11 @@ class ClusterState:
 
         # Sort ready tasks by priority (1=highest first), then by creation time
         with self._tasks_lock:
+            # The ready-status filter already excludes cancel_requested/cancelled;
+            # terminality is enforced in set_task_status (B1).
             ready_tasks = sorted(
-                [t for t in self._tasks.values() if t.status == TaskStatus.ready],
+                [t for t in self._tasks.values()
+                 if t.status == TaskStatus.ready],
                 key=lambda t: (t.priority, t.created_at),
             )
             for task in ready_tasks:

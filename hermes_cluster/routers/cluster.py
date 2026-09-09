@@ -21,6 +21,7 @@ async def cluster_status():
     """Cluster overview for Dashboard."""
     task_counts = _state.task_counts()
     uptime_seconds = int((datetime.utcnow() - _state.started_at).total_seconds())
+    # S3 fix: surface all task counts including cancel states
     return {
         "cluster_id": _state.cluster_id,
         "node_count": _state.node_count(),
@@ -32,6 +33,9 @@ async def cluster_status():
             "running": task_counts.get("running", 0),
             "completed": task_counts.get("completed", 0),
             "failed": task_counts.get("failed", 0),
+            "blocked": task_counts.get("blocked", 0),
+            "cancel_requested": task_counts.get("cancel_requested", 0),
+            "cancelled": task_counts.get("cancelled", 0),
         },
         "uptime_seconds": uptime_seconds,
         "version": "python-1.0.0",

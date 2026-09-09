@@ -51,6 +51,8 @@ class TaskStatus(str, Enum):
     completed = "completed"
     failed = "failed"
     blocked = "blocked"
+    cancel_requested = "cancel_requested"
+    cancelled = "cancelled"
 
 
 class LeaseStatus(str, Enum):
@@ -64,6 +66,8 @@ class SyncEventType(str, Enum):
     task_assigned = "task_assigned"
     task_completed = "task_completed"
     task_failed = "task_failed"
+    task_cancel_requested = "task_cancel_requested"
+    task_cancelled = "task_cancelled"
 
 
 class EventType(str, Enum):
@@ -72,6 +76,8 @@ class EventType(str, Enum):
     task_completed = "task_completed"
     task_failed = "task_failed"
     node_offline = "node_offline"
+    task_cancel_requested = "task_cancel_requested"
+    task_cancelled = "task_cancelled"
 
 
 class FederationClusterStatus(str, Enum):
@@ -685,6 +691,10 @@ class SubmitTaskRequest(BaseModel):
 
 class FailTaskRequest(BaseModel):
     reason: str = "failed"
+
+
+class CancelTaskRequest(BaseModel):
+    reason: str = "cancelled"
 
 
 class SetDependenciesRequest(BaseModel):
