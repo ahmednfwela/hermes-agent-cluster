@@ -61,6 +61,7 @@ def create_app(
     fed_token: str = "",
     cluster_endpoint: str = "",
     node_capabilities: Optional[list] = None,
+    agent_executor_config: Optional[dict] = None,
     static_dir: Optional[str] = None,
 ) -> FastAPI:
     """Create and configure the FastAPI application.
@@ -177,10 +178,35 @@ def create_app(
             peer_token=fed_token,
         )
 
+    # Agent executor: when role=worker and agent_executor is configured+enabled,
+    # start the poll loop that claims leased tasks and spawns bdaya workers.
+    _agent_executor = None
+    if node_role == "worker" and cluster_endpoint and agent_executor_config:
+        from .core.agent_executor import AgentExecutor, AgentExecutorConfig
+        ae_cfg_dict = agent_executor_config or {}
+        if ae_cfg_dict.get("enabled", False):
+            ae_cfg = AgentExecutorConfig(
+                enabled=True,
+                profile=ae_cfg_dict.get("profile", "alibaba1"),
+                model=ae_cfg_dict.get("model", "qwen3.7-plus"),
+                poll_interval=float(ae_cfg_dict.get("poll_interval", 15)),
+                max_concurrent=int(ae_cfg_dict.get("max_concurrent", 1)),
+                spawn_timeout=float(ae_cfg_dict.get("spawn_timeout", 1800)),
+                working_dir=ae_cfg_dict.get("working_dir", ""),
+            )
+            _agent_executor = AgentExecutor(
+                config=ae_cfg,
+                node_id=state.node_id,
+                cluster_endpoint=cluster_endpoint,
+                peer_token=fed_token,
+            )
+            _agent_executor.start()
+
     # Store on state for router access
     state._node_manager = _node_manager
     state._lease_manager = _lease_manager
     state._recovery_manager = _recovery_manager
+    state._agent_executor = _agent_executor
 
     # Wire up all routers with shared state
     nodes_mod.init(state, node_manager=_node_manager)
@@ -247,6 +273,8 @@ def create_app(
         _node_manager.stop_watchdog()
         _lease_manager.stop()
         _recovery_manager.stop_auto_recovery()
+        if _agent_executor:
+            _agent_executor.stop()
 
     # Dashboard static file serving
     if static_dir:

@@ -66,3 +66,12 @@ async def status(
 @router.get("/summary")
 async def summary():
     return _state.get_summary()
+
+
+@router.get("/executor/status")
+async def executor_status():
+    """Agent executor diagnostics — active spawns, config, health."""
+    executor = getattr(_state, "_agent_executor", None)
+    if not executor:
+        return {"enabled": False, "message": "agent executor not running on this node"}
+    return {**executor.status(), "enabled": True}

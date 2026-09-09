@@ -42,6 +42,8 @@ def main():
             if "server" in cfg:
                 args.port = cfg["server"].get("port", args.port)
                 args.host = cfg["server"].get("bind", args.host)
+            if "agent_executor" in cfg:
+                args.agent_executor_config = cfg["agent_executor"]
         except ImportError:
             print("Warning: PyYAML not installed, ignoring config file", file=sys.stderr)
         except Exception as e:
@@ -66,6 +68,7 @@ def main():
         fed_token=args.fed_token,
         cluster_endpoint=args.cluster_endpoint,
         node_capabilities=getattr(args, "node_capabilities", []),
+        agent_executor_config=getattr(args, "agent_executor_config", None),
         static_dir=static_dir if static_dir else None,
     )
 
