@@ -10,6 +10,7 @@ Endpoints:
 
 from __future__ import annotations
 
+import copy
 import os
 import signal
 import sys
@@ -103,10 +104,34 @@ def _config_to_yaml(cfg: Dict[str, Any]) -> str:
 
 @router.get("")
 async def get_config(defaults: bool = Query(False, description="Return default config")):
-    """GET /api/v1/config — return current config or defaults."""
+    """GET /api/v1/config — return current config or defaults.
+
+    H1 fix: redact token fields from the response to prevent secret leakage.
+    """
     if defaults:
-        return ConfigJSON().model_dump()
-    cfg = _current_config()
+        cfg = ConfigJSON().model_dump()
+    else:
+        cfg = _current_config()
+    # N3a: deep-copy before redaction — _redact_tokens mutates in place,
+    # and _current_config() returns the LIVE store dict. Without copy, a
+    # GET would permanently overwrite tokens with "***REDACTED***" (N3b).
+    cfg = copy.deepcopy(cfg)
+    _redact_tokens(cfg)
+    return cfg
+
+
+def _redact_tokens(cfg: dict) -> dict:
+    """Recursively redact token fields from config dict (H1 fix)."""
+    _REDACT_KEYS = {"token", "secret", "password"}
+    if isinstance(cfg, dict):
+        for key in list(cfg.keys()):
+            if key in _REDACT_KEYS:
+                cfg[key] = "***REDACTED***"
+            else:
+                _redact_tokens(cfg[key])
+    elif isinstance(cfg, list):
+        for item in cfg:
+            _redact_tokens(item)
     return cfg
 
 
@@ -157,20 +182,31 @@ async def validate_config(cfg: Optional[ConfigJSON] = None):
     errors = _validate_config(config_dict)
     valid = len(errors) == 0
 
+    # N3c: redact tokens from the echoed config — validate previously
+    # returned the live config raw, leaking tokens to any authenticated peer.
+    config_echo = copy.deepcopy(config_dict)
+    _redact_tokens(config_echo)
+
     return {
         "valid": valid,
         "errors": errors,
-        "config": config_dict,
+        "config": config_echo,
     }
 
 
 @router.get("/yaml")
 async def get_config_yaml(defaults: bool = Query(False, description="Return default config as YAML")):
-    """GET /api/v1/config/yaml — return config as YAML string."""
+    """GET /api/v1/config/yaml — return config as YAML string.
+
+    H1 fix: redact token fields.
+    """
     if defaults:
         cfg = ConfigJSON().model_dump()
     else:
         cfg = _current_config()
+    # N3a: deep-copy before redaction (same fix as GET /config)
+    cfg = copy.deepcopy(cfg)
+    _redact_tokens(cfg)
 
     yaml_str = _config_to_yaml(cfg)
     return PlainTextResponse(content=yaml_str, media_type="text/yaml")

@@ -79,7 +79,42 @@ def create_app(
         redoc_url="/redoc",
     )
 
-    # CORS middleware
+    # Peer-token auth (P1.2) — H2: per-app state, L2: INSIDE CORS
+    # L2 fix: register PeerAuth BEFORE CORS so it sits INSIDE CORS.
+    # Starlette middleware is a stack: last added = outermost. So:
+    #   add_middleware(PeerAuth) then add_middleware(CORS) →
+    #   request: CORS → PeerAuth → app; response: app → PeerAuth → CORS
+    # This ensures 401s from PeerAuth carry CORS headers (ACAO).
+    import os as _os
+    from .core.peer_auth import PeerAuthState
+    from .auth_middleware import PeerAuthMiddleware
+    _local_token = _os.environ.get("PEER_TOKEN", fed_token)
+    _peer_tokens_env = _os.environ.get("PEER_TOKENS", "")  # "nodeA:tokenA,nodeB:tokenB"
+    _peer_tokens_map = {}
+    if _peer_tokens_env:
+        for entry in _peer_tokens_env.split(","):
+            if ":" in entry:
+                nid, tok = entry.split(":", 1)
+                _peer_tokens_map[nid.strip()] = tok.strip()
+    _peer_auth_enabled = bool(_local_token) and bool(_peer_tokens_map)
+    # H2: create a per-app state, not module globals
+    _peer_auth_state = PeerAuthState(
+        local_node_id=node_id,
+        local_token=_local_token if _peer_auth_enabled else "",
+        peer_tokens=_peer_tokens_map if _peer_auth_enabled else {},
+    )
+    # Also configure the module-level default (for plugin.py outgoing calls
+    # in single-process mode, where the plugin shares the server's process)
+    if _peer_auth_enabled:
+        from .core import peer_auth as _peer_auth_mod
+        _peer_auth_mod.configure(
+            local_node_id=node_id,
+            local_token=_local_token,
+            peer_tokens=_peer_tokens_map,
+        )
+    app.add_middleware(PeerAuthMiddleware, state=_peer_auth_state, enabled=_peer_auth_enabled)
+
+    # CORS middleware — added AFTER PeerAuth so CORS is outermost
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],

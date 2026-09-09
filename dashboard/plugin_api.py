@@ -2,7 +2,7 @@
 hermes-agent-cluster dashboard plugin — backend API routes.
 
 Mounts at /api/plugins/agent-cluster/ via the Hermes Dashboard plugin system.
-Proxies requests to the hermes-cluster Go service.
+Proxies requests to the hermes-cluster service.
 Supports config management: read/write cluster.yaml, runtime capability updates.
 """
 
@@ -39,11 +39,37 @@ _CONFIG_PATHS = [
 # ---------------------------------------------------------------------------
 
 def _proxy(method: str, path: str, data: dict = None) -> Any:
-    """Proxy an API call to the hermes-cluster Go service."""
+    """Proxy an API call to the hermes-cluster service.
+
+    D2b fix: signs outgoing requests via peer_auth when configured,
+    so the dashboard works with auth ON.
+
+    bdaya-defer:(shared/claude-plugins#804) — signing is conditional on
+    peer_auth.is_configured(), but the dashboard process (Hermes Dashboard
+    plugin host) does not configure PEER_TOKEN/PEER_TOKENS from env, so
+    is_configured() returns False and signing is silently skipped. Fix:
+    configure peer_auth in the dashboard process from env/cluster.yaml
+    at startup, or route through a helper that does.
+    """
     url = f"{_CLUSTER_ENDPOINT}{path}"
     body = json.dumps(data).encode() if data else None
     req = Request(url, data=body, method=method)
     req.add_header("Content-Type", "application/json")
+    # D2b: sign the request when peer auth is configured
+    # bdaya-defer:(shared/claude-plugins#804) — see docstring; dashboard
+    # process does not configure peer_auth, so this is a no-op today.
+    try:
+        from hermes_cluster.core import peer_auth
+        if peer_auth.is_configured():
+            from hermes_cluster.core.peer_auth import build_signed_path
+            signed_path = build_signed_path(url)
+            auth_headers = peer_auth.sign_request(method, signed_path, body or b"")
+            for key, value in auth_headers.items():
+                req.add_header(key, value)
+    except Exception as e:
+        # bdaya-defer:(shared/claude-plugins#804) — sign-failure should log
+        # at warning, not debug — silent skip hides auth gaps.
+        logger.warning("Peer auth signing skipped: %s", e)
     try:
         with urlopen(req, timeout=10) as resp:
             raw = resp.read().decode()

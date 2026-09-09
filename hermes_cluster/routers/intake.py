@@ -55,8 +55,9 @@ def init(state: ClusterState):
     webhook_secret = os.environ.get("GITLAB_INTAKE_WEBHOOK_SECRET", "")
     if not webhook_secret:
         logger.warning(
-            "GITLAB_INTAKE_WEBHOOK_SECRET not set — webhook accepts any POST. "
-            "Set this env var in production to validate X-Gitlab-Token."
+            "GITLAB_INTAKE_WEBHOOK_SECRET not set — webhook has NO auth "
+            "(peer-auth does NOT gate this path; X-Gitlab-Token is its only auth). "
+            "Set this env var in production."
         )
 
     if token:

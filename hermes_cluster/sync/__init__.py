@@ -131,6 +131,10 @@ class SyncClient:
     Uses httpx for async-capable HTTP. Falls back gracefully on connection
     failures (logs warning, returns False — never crashes the sync loop).
 
+    bdaya-defer:(shared/claude-plugins#804) — does NOT sign outgoing requests
+    via peer_auth. With peer auth ON, remote nodes reject sync with 401.
+    Fix: sign via peer_auth.sign_request() in send_batch/send_single/send_full_state.
+
     Usage:
         client = SyncClient(timeout=5.0)
         ok = client.send_batch("http://node-b:8787", batch_msg)
