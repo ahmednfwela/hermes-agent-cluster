@@ -10,13 +10,17 @@ polls every 30s. Configure endpoint via `GITLAB_INTAKE_ENDPOINT` env var
 (default: https://gitlab.bdaya-dev.com) and project via `GITLAB_INTAKE_PROJECT`
 (default: shared%2Fclaude-plugins).
 
-All ingested tasks carry `requires: ["tooling"]` and a `source` metadata field
-pointing to the originating GitLab issue URL.
+All ingested tasks carry `requires: ["tooling"]` and a title prefixed with the
+issue iid (e.g., `[#123] Issue title`).
+
+Webhook authentication: set `GITLAB_INTAKE_WEBHOOK_SECRET` to validate the
+`X-Gitlab-Token` header. When unset, the webhook accepts any POST (logs a warning).
 """
 
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
 import os
 import secrets
@@ -27,6 +31,7 @@ from typing import Any, Dict, List, Optional
 import httpx
 from fastapi import APIRouter, HTTPException, Request
 
+from ..models import Task
 from ..state import ClusterState
 
 logger = logging.getLogger("hermes_cluster.intake")
@@ -46,6 +51,14 @@ def init(state: ClusterState):
     project = os.environ.get("GITLAB_INTAKE_PROJECT", "shared%2Fclaude-plugins")
     label = os.environ.get("GITLAB_INTAKE_LABEL", "tooling")
     interval = int(os.environ.get("GITLAB_INTAKE_INTERVAL", "30"))
+
+    webhook_secret = os.environ.get("GITLAB_INTAKE_WEBHOOK_SECRET", "")
+    if not webhook_secret:
+        logger.warning(
+            "GITLAB_INTAKE_WEBHOOK_SECRET not set — webhook accepts any POST. "
+            "Set this env var in production to validate X-Gitlab-Token."
+        )
+
     if token:
         _poller = _GitLabPoller(
             state=state,
@@ -69,8 +82,19 @@ async def webhook(request: Request):
 
     Accepts `issue` events. For `open`/`reopen` actions on issues carrying the
     configured label, creates a cluster task. Idempotent: if a task already
-    exists for this issue (by source metadata), returns the existing task.
+    exists for this issue (by iid), returns the existing task with status="deduped".
+
+    Authentication: if GITLAB_INTAKE_WEBHOOK_SECRET is set, validates the
+    X-Gitlab-Token header using constant-time comparison.
     """
+    # Validate webhook secret if configured
+    webhook_secret = os.environ.get("GITLAB_INTAKE_WEBHOOK_SECRET", "")
+    if webhook_secret:
+        token = request.headers.get("X-Gitlab-Token", "")
+        if not hmac.compare_digest(token, webhook_secret):
+            logger.warning("Webhook rejected: invalid or missing X-Gitlab-Token")
+            raise HTTPException(status_code=401, detail="Invalid webhook token")
+
     body = await request.json()
     event_type = body.get("object_kind")
     if event_type != "issue":
@@ -86,10 +110,15 @@ async def webhook(request: Request):
         return {"status": "ignored", "reason": f"action={action}"}
 
     issue_iid = attrs.get("iid")
+    # Validate iid is an integer (prevents None-key collision in dedup map)
+    if not isinstance(issue_iid, int):
+        logger.warning("Webhook rejected: missing or non-integer iid=%r", issue_iid)
+        raise HTTPException(status_code=400, detail=f"Invalid or missing iid: {issue_iid!r}")
+
     title = attrs.get("title", "")
-    url = attrs.get("url", "")
-    task = _create_task_from_issue(issue_iid=issue_iid, title=title, url=url, label=label)
-    return {"status": "created", "task_id": task.id, "task": task.model_dump(mode="json")}
+    task, is_new = _create_task_from_issue(issue_iid=issue_iid, title=title, label=label)
+    status = "created" if is_new else "deduped"
+    return {"status": status, "task_id": task.id, "task": task.model_dump(mode="json")}
 
 
 # ---------------------------------------------------------------------------
@@ -101,8 +130,18 @@ async def poll():
     """Manually trigger a GitLab poll. Returns list of task IDs created."""
     if _poller is None:
         raise HTTPException(status_code=503, detail="GitLab intake poller not configured (set GITLAB_INTAKE_TOKEN)")
-    created = await _poller.poll_once()
-    return {"status": "ok", "created": len(created), "task_ids": created}
+    try:
+        created = await _poller.poll_once()
+        return {"status": "ok", "created": len(created), "task_ids": created}
+    except httpx.HTTPStatusError as e:
+        logger.error("GitLab poll failed: HTTP %s", e.response.status_code)
+        raise HTTPException(status_code=502, detail=f"GitLab API error: {e.response.status_code}")
+    except httpx.RequestError as e:
+        logger.error("GitLab poll failed: %s", e)
+        raise HTTPException(status_code=503, detail=f"GitLab connection error: {e}")
+    except Exception as e:
+        logger.exception("GitLab poll failed unexpectedly")
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
 
 
 @router.get("/status")
@@ -125,15 +164,18 @@ async def status():
 def _create_task_from_issue(
     issue_iid: int,
     title: str,
-    url: str,
     label: str,
-):
-    """Create a cluster task from a GitLab issue, dedup by source iid."""
+) -> tuple[Task, bool]:
+    """Create a cluster task from a GitLab issue, dedup by iid.
+
+    Returns (task, is_new) where is_new=True if a new task was created,
+    False if an existing task was returned (dedup hit).
+    """
     # Dedup by issue iid (module-level mapping survives within-process restarts)
     if issue_iid in _issue_iid_to_task_id:
         existing = _state.get_task(_issue_iid_to_task_id[issue_iid])
         if existing is not None:
-            return existing
+            return existing, False
 
     task_id = "task_" + secrets.token_hex(8)
     task = _state.create_task(
@@ -144,7 +186,7 @@ def _create_task_from_issue(
     )
     _issue_iid_to_task_id[issue_iid] = task_id
     _state.trigger_pending_tasks()
-    return task
+    return task, True
 
 
 # ---------------------------------------------------------------------------
@@ -221,12 +263,12 @@ class _GitLabPoller:
                 self._seen_iids.add(iid)
                 continue
             self._seen_iids.add(iid)
-            task = _create_task_from_issue(
+            task, is_new = _create_task_from_issue(
                 issue_iid=iid,
                 title=issue["title"],
-                url=issue["web_url"],
                 label=self.label,
             )
-            self.tasks_created += 1
-            created_ids.append(task.id)
+            if is_new:
+                self.tasks_created += 1
+                created_ids.append(task.id)
         return created_ids
