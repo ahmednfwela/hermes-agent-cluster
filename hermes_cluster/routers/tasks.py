@@ -125,11 +125,11 @@ def _cascade_cancel_dependents(task_id: str, reason: str) -> list:
         terminal = {TaskStatus.completed, TaskStatus.failed, TaskStatus.cancelled, TaskStatus.cancel_requested}
         if dep_task.status in terminal:
             continue
-        # Running tasks with a lease → cancel_requested (two-phase); others → cancelled immediately
-        if dep_task.status == TaskStatus.running or dep_task.status == TaskStatus.cancel_requested:
-            lease = _lease_manager.get_by_task(dep_id) if _lease_manager else None
-            if lease:
-                _lease_manager.revoke(lease.id)
+        # R3-1 fix: branch on lease existence (like cancel_task S2), not status.
+        # Running + unleased (scheduler-assigned) → cancelled immediately, not cancel_requested zombie.
+        lease = _lease_manager.get_by_task(dep_id) if _lease_manager else None
+        if lease is not None:
+            _lease_manager.revoke(lease.id)
             _state.set_task_status(dep_id, TaskStatus.cancel_requested, fail_reason=reason)
         else:
             _state.set_task_status(dep_id, TaskStatus.cancelled, fail_reason=reason)
@@ -306,15 +306,14 @@ async def release_task(task_id: str, req: ReleaseTaskRequest):
         if lease:
             _lease_manager.revoke(lease.id)
 
-    # S7 fix: honor the terminality guard — if set_task_status rejects the
-    # transition (e.g. cancel_requested/cancelled), don't clear assigned_to
-    # and return the current state rather than reporting a transition that
-    # didn't happen.
+    # S7 residual fix: honor the terminality guard — if set_task_status rejects the
+    # transition (e.g. cancel_requested/cancelled), return 409 instead of 200.
     transitioned = _state.set_task_status(task_id, TaskStatus.ready)
     if not transitioned:
-        # Guard rejected — task is in a terminal state. Return current state as-is.
-        released_task = _state.get_task(task_id)
-        return released_task.model_dump()
+        raise HTTPException(
+            status_code=409,
+            detail=f"task is terminal (status={task.status.value}), cannot release to ready",
+        )
 
     with _state._tasks_lock:
         t = _state._tasks[task_id]

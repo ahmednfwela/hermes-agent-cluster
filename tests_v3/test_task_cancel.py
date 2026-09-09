@@ -704,3 +704,64 @@ class TestRound2Fixes:
         child = next(t for t in tasks if t["id"] == child_id)
         assert child["status"] == "cancel_requested", \
             f"running dependent with lease should be cancel_requested, got {child['status']}"
+
+
+# ---------------------------------------------------------------------------
+# 9. Round-3 regression test (R3-1)
+# ---------------------------------------------------------------------------
+
+class TestRound3Fixes:
+    """Regression test for round-3 review finding R3-1."""
+
+    def test_r3_1_unleased_running_dependent_cancelled_immediately(self, client):
+        """R3-1: cascade must branch on lease existence, not status.
+
+        A scheduler-assigned running task has status=running but NO lease.
+        When its parent fails/cancels, it must be cancelled immediately,
+        NOT set to cancel_requested (which would be an un-ackable zombie).
+        """
+        node_id = _join_node(client)
+        parent_id = _create_task(client)
+        child_id = _create_task(client)
+        client.post(f"/api/v1/tasks/{child_id}/dependencies", json={"depends_on": [parent_id]})
+
+        # Scheduler assigns child to running (no lease created by scheduler)
+        resp = client.post("/api/v1/schedule/trigger")
+        assert resp.status_code == 200
+
+        # Verify child is running (scheduler-assigned)
+        tasks = client.get("/api/v1/tasks").json()
+        child = next(t for t in tasks if t["id"] == child_id)
+        assert child["status"] == "running", \
+            f"child should be running (scheduler-assigned), got {child['status']}"
+
+        # Verify NO lease exists for child (scheduler doesn't create leases)
+        leases = client.get("/api/v1/leases").json()
+        active_leases_for_child = [l for l in leases if l["task_id"] == child_id and l["status"] == "active"]
+        assert len(active_leases_for_child) == 0, \
+            "scheduler-assigned running task must have no lease"
+
+        # Fail parent — child should cascade to cancelled immediately (not cancel_requested)
+        client.post(f"/api/v1/tasks/{parent_id}/fail", json={"reason": "broken"})
+
+        tasks = client.get("/api/v1/tasks").json()
+        child_after = next(t for t in tasks if t["id"] == child_id)
+        assert child_after["status"] == "cancelled", \
+            f"unleased running dependent must be cancelled immediately, got {child_after['status']}"
+
+    def test_s7_residual_release_returns_409_on_terminal_task(self, client):
+        """S7 residual: /release must return 409 when task is terminal, not 200."""
+        node_id = _join_node(client)
+        task_id = _create_task(client)
+
+        # Claim the task (creates lease, sets to running)
+        client.post(f"/api/v1/tasks/{task_id}/claim", json={"node_id": node_id})
+
+        # Cancel the task (revokes lease, sets to cancel_requested)
+        client.post(f"/api/v1/tasks/{task_id}/cancel")
+
+        # Try to release — should 409 (task is cancel_requested, terminal)
+        resp = client.post(f"/api/v1/tasks/{task_id}/release", json={"node_id": node_id})
+        assert resp.status_code == 409, \
+            f"/release on terminal task must return 409, got {resp.status_code}"
+        assert "terminal" in resp.json()["detail"].lower()
