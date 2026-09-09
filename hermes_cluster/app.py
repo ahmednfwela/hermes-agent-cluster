@@ -88,6 +88,27 @@ def create_app(
         allow_headers=["*"],
     )
 
+    # Peer-token auth (P1.2) — protects /api/v1/federation/ endpoints
+    import os as _os
+    from .core import peer_auth as _peer_auth
+    from .auth_middleware import PeerAuthMiddleware
+    _local_token = _os.environ.get("PEER_TOKEN", fed_token)
+    _peer_tokens_env = _os.environ.get("PEER_TOKENS", "")  # "nodeA:tokenA,nodeB:tokenB"
+    _peer_tokens_map = {}
+    if _peer_tokens_env:
+        for entry in _peer_tokens_env.split(","):
+            if ":" in entry:
+                nid, tok = entry.split(":", 1)
+                _peer_tokens_map[nid.strip()] = tok.strip()
+    _peer_auth_enabled = bool(_local_token) and bool(_peer_tokens_map)
+    if _peer_auth_enabled:
+        _peer_auth.configure(
+            local_node_id=node_id,
+            local_token=_local_token,
+            peer_tokens=_peer_tokens_map,
+        )
+    app.add_middleware(PeerAuthMiddleware, enabled=_peer_auth_enabled)
+
     # Initialize state
     state = ClusterState()
     state.cluster_id = cluster_id
