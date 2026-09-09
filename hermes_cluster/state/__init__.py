@@ -287,6 +287,7 @@ class ClusterState:
         counts = {
             "total": 0, "ready": 0, "running": 0,
             "completed": 0, "failed": 0, "pending": 0,
+            "blocked": 0, "cancel_requested": 0, "cancelled": 0,
         }
         with self._tasks_lock:
             for task in self._tasks.values():
@@ -392,7 +393,7 @@ class ClusterState:
                 task_id = msg.task_state.task_id
                 if task_id in self._tasks:
                     task = self._tasks[task_id]
-                    task.status = TaskStatus(msg.task_state.status) if msg.task_state.status in TaskStatus.__members__.values() else task.status
+                    task.status = TaskStatus(msg.task_state.status) if msg.task_state.status in [s.value for s in TaskStatus] else task.status
                     if msg.task_state.assigned_to:
                         task.assigned_to = msg.task_state.assigned_to
                     task.version = msg.task_state.version
@@ -402,7 +403,7 @@ class ClusterState:
                     self._tasks[task_id] = Task(
                         id=task_id,
                         title=msg.task_state.title,
-                        status=TaskStatus(msg.task_state.status) if msg.task_state.status in TaskStatus.__members__.values() else TaskStatus.pending,
+                        status=TaskStatus(msg.task_state.status) if msg.task_state.status in [s.value for s in TaskStatus] else TaskStatus.pending,
                         assigned_to=msg.task_state.assigned_to,
                         version=msg.task_state.version,
                     )
@@ -515,8 +516,13 @@ class ClusterState:
 
         # Sort ready tasks by priority (1=highest first), then by creation time
         with self._tasks_lock:
+            # Explicitly skip cancelled tasks (defense-in-depth: ready filter
+            # already excludes them, but this makes the invariant explicit)
+            _CANCEL_STATES = {TaskStatus.cancel_requested, TaskStatus.cancelled}
             ready_tasks = sorted(
-                [t for t in self._tasks.values() if t.status == TaskStatus.ready],
+                [t for t in self._tasks.values()
+                 if t.status == TaskStatus.ready
+                 and t.status not in _CANCEL_STATES],
                 key=lambda t: (t.priority, t.created_at),
             )
             for task in ready_tasks:

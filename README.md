@@ -173,6 +173,8 @@ All endpoints prefixed: `/api/v1`
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `GET` | `/tasks/{id}/dependents` | Get downstream tasks depending on this task |
+
+**Task States:** `pending`, `ready`, `assigned`, `running`, `completed`, `failed`, `blocked`, `cancel_requested`, `cancelled`
 | `GET` | `/tasks/{id}/trigger-chain` | Get trigger chain |
 | `GET` | `/workflow/graph` | Get workflow dependency graph |
 

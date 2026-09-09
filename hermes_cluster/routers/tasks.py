@@ -5,6 +5,7 @@ from fastapi import APIRouter, HTTPException, Request
 from ..models import (
     SubmitTaskRequest,
     FailTaskRequest,
+    CancelTaskRequest,
     SetDependenciesRequest,
     ClaimTaskRequest,
     ReleaseTaskRequest,
@@ -57,6 +58,11 @@ async def complete_task(task_id: str):
         if lease:
             _lease_manager.revoke(lease.id)
 
+    # If task was cancel_requested, worker ack closes it to cancelled
+    if task.status == TaskStatus.cancel_requested:
+        _state.set_task_status(task_id, TaskStatus.cancelled, fail_reason="cancelled")
+        return {"status": "cancelled"}
+
     _state.set_task_status(task_id, TaskStatus.completed)
     # Auto-transition downstream tasks
     _trigger_downstream(task_id)
@@ -69,6 +75,12 @@ async def fail_task(task_id: str, req: FailTaskRequest = None):
     if not task:
         raise HTTPException(status_code=404, detail="task not found")
     reason = req.reason if req else "failed"
+
+    # If task was cancel_requested, worker ack closes it to cancelled
+    if task.status == TaskStatus.cancel_requested:
+        _state.set_task_status(task_id, TaskStatus.cancelled, fail_reason=reason)
+        return {"status": "cancelled", "blocked": []}
+
     _state.set_task_status(task_id, TaskStatus.failed, fail_reason=reason)
     # Block downstream tasks
     blocked = _state.get_dependents(task_id)
@@ -77,6 +89,49 @@ async def fail_task(task_id: str, req: FailTaskRequest = None):
         if dep_task and dep_task.status == TaskStatus.pending:
             _state.set_task_status(dep_id, TaskStatus.blocked)
     return {"status": "failed", "blocked": blocked}
+
+
+@router.post("/{task_id}/cancel")
+async def cancel_task(task_id: str, req: CancelTaskRequest = None):
+    """Cancel a task — two-phase for running tasks, immediate for unclaimed.
+
+    Mirrors the /fail handler structure:
+    - Unclaimed (pending/ready) → cancelled immediately
+    - Claimed/running → lease revoked, → cancel_requested; worker's next
+      /complete or /fail closes to cancelled
+    - Terminal (completed/failed/cancelled/cancel_requested) → 409
+    """
+    task = _state.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="task not found")
+
+    reason = req.reason if req else "cancelled"
+
+    # Terminal states → 409 (ERR_TASK_NOT_CANCELABLE)
+    if task.status in (
+        TaskStatus.completed,
+        TaskStatus.failed,
+        TaskStatus.cancelled,
+        TaskStatus.cancel_requested,
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=f"task is not cancelable (status={task.status.value})",
+        )
+
+    # Unclaimed → cancelled immediately
+    if task.status in (TaskStatus.pending, TaskStatus.ready):
+        _state.set_task_status(task_id, TaskStatus.cancelled, fail_reason=reason)
+        return {"status": "cancelled", "phase": "immediate"}
+
+    # Claimed/running → revoke lease, → cancel_requested
+    if _lease_manager:
+        lease = _lease_manager.get_by_task(task_id)
+        if lease:
+            _lease_manager.revoke(lease.id)
+
+    _state.set_task_status(task_id, TaskStatus.cancel_requested, fail_reason=reason)
+    return {"status": "cancel_requested", "phase": "pending_ack"}
 
 
 @router.post("/{task_id}/unblock")
