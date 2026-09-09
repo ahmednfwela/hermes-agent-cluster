@@ -192,10 +192,31 @@ class ClusterState:
             return list(self._tasks.values())
 
     def set_task_status(self, task_id: str, status: TaskStatus, fail_reason: str = "") -> bool:
+        """Set task status. Returns True on success.
+
+        Terminal-state invariant (B1 fix): completed/failed/cancelled/cancel_requested
+        are terminal — once a task reaches one of these states, it cannot transition
+        back to a non-terminal state (except cancel_requested → cancelled, which is
+        the worker-acknowledgement path in the two-phase cancel protocol).
+        """
         with self._tasks_lock:
             if task_id not in self._tasks:
                 return False
             task = self._tasks[task_id]
+            # Terminal states (B1): enforce terminality. The only allowed transition
+            # FROM a terminal state is cancel_requested → cancelled (worker ack).
+            _terminal = {
+                TaskStatus.completed,
+                TaskStatus.failed,
+                TaskStatus.cancelled,
+                TaskStatus.cancel_requested,
+            }
+            if task.status in _terminal:
+                # Allow the two-phase cancel ack: cancel_requested → cancelled
+                if task.status == TaskStatus.cancel_requested and status == TaskStatus.cancelled:
+                    pass  # allow transition
+                else:
+                    return False  # reject transition to non-terminal
             task.status = status
             task.updated_at = datetime.utcnow()
             task.version += 1
@@ -208,12 +229,21 @@ class ClusterState:
 
         This is the proper way to unassign a task — it avoids the race
         condition of separate set_task_status + direct attribute access.
-        Returns True if the task existed.
+        Returns True if the task existed and was not terminal (B1).
         """
         with self._tasks_lock:
             if task_id not in self._tasks:
                 return False
             task = self._tasks[task_id]
+            # Terminal-state guard (B1): do not revive a terminal task
+            _terminal = {
+                TaskStatus.completed,
+                TaskStatus.failed,
+                TaskStatus.cancelled,
+                TaskStatus.cancel_requested,
+            }
+            if task.status in _terminal:
+                return False
             task.assigned_to = None
             task.status = TaskStatus.ready
             task.updated_at = datetime.utcnow()
@@ -516,13 +546,11 @@ class ClusterState:
 
         # Sort ready tasks by priority (1=highest first), then by creation time
         with self._tasks_lock:
-            # Explicitly skip cancelled tasks (defense-in-depth: ready filter
-            # already excludes them, but this makes the invariant explicit)
-            _CANCEL_STATES = {TaskStatus.cancel_requested, TaskStatus.cancelled}
+            # The ready-status filter already excludes cancel_requested/cancelled;
+            # terminality is enforced in set_task_status (B1).
             ready_tasks = sorted(
                 [t for t in self._tasks.values()
-                 if t.status == TaskStatus.ready
-                 and t.status not in _CANCEL_STATES],
+                 if t.status == TaskStatus.ready],
                 key=lambda t: (t.priority, t.created_at),
             )
             for task in ready_tasks:

@@ -52,6 +52,14 @@ async def complete_task(task_id: str):
     if not task:
         raise HTTPException(status_code=404, detail="task not found")
 
+    # B2 fix: terminal states (completed/failed/cancelled) → 409
+    # cancel_requested is allowed through (worker ack path)
+    if task.status in (TaskStatus.completed, TaskStatus.failed, TaskStatus.cancelled):
+        raise HTTPException(
+            status_code=409,
+            detail=f"task is already terminal (status={task.status.value})",
+        )
+
     # Revoke lease
     if _lease_manager:
         lease = _lease_manager.get_by_task(task_id)
@@ -76,18 +84,26 @@ async def fail_task(task_id: str, req: FailTaskRequest = None):
         raise HTTPException(status_code=404, detail="task not found")
     reason = req.reason if req else "failed"
 
+    # B2 fix: terminal states (completed/failed/cancelled) → 409
+    # cancel_requested is allowed through (worker ack path)
+    if task.status in (TaskStatus.completed, TaskStatus.failed, TaskStatus.cancelled):
+        raise HTTPException(
+            status_code=409,
+            detail=f"task is already terminal (status={task.status.value})",
+        )
+
     # If task was cancel_requested, worker ack closes it to cancelled
     if task.status == TaskStatus.cancel_requested:
         _state.set_task_status(task_id, TaskStatus.cancelled, fail_reason=reason)
         return {"status": "cancelled", "blocked": []}
 
     _state.set_task_status(task_id, TaskStatus.failed, fail_reason=reason)
-    # Block downstream tasks
+    # S4 fix: cascade-cancel dependents that are still pending/ready/blocked
     blocked = _state.get_dependents(task_id)
     for dep_id in blocked:
         dep_task = _state.get_task(dep_id)
-        if dep_task and dep_task.status == TaskStatus.pending:
-            _state.set_task_status(dep_id, TaskStatus.blocked)
+        if dep_task and dep_task.status in (TaskStatus.pending, TaskStatus.ready, TaskStatus.blocked):
+            _state.set_task_status(dep_id, TaskStatus.cancelled, fail_reason=f"parent {task_id} failed")
     return {"status": "failed", "blocked": blocked}
 
 
@@ -119,17 +135,15 @@ async def cancel_task(task_id: str, req: CancelTaskRequest = None):
             detail=f"task is not cancelable (status={task.status.value})",
         )
 
-    # Unclaimed → cancelled immediately
-    if task.status in (TaskStatus.pending, TaskStatus.ready):
+    # S2 fix: branch on lease existence, not status (per #799 note 131686 item 8)
+    # No lease → cancelled immediately; has lease → revoke, → cancel_requested
+    lease = _lease_manager.get_by_task(task_id) if _lease_manager else None
+    if lease is None:
         _state.set_task_status(task_id, TaskStatus.cancelled, fail_reason=reason)
         return {"status": "cancelled", "phase": "immediate"}
 
-    # Claimed/running → revoke lease, → cancel_requested
-    if _lease_manager:
-        lease = _lease_manager.get_by_task(task_id)
-        if lease:
-            _lease_manager.revoke(lease.id)
-
+    # Has lease → revoke it, → cancel_requested
+    _lease_manager.revoke(lease.id)
     _state.set_task_status(task_id, TaskStatus.cancel_requested, fail_reason=reason)
     return {"status": "cancel_requested", "phase": "pending_ack"}
 
@@ -146,6 +160,17 @@ async def manual_advance(task_id: str):
     task = _state.get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="task not found")
+    # B1 fix: reject advance for terminal/cancel states
+    if task.status in (
+        TaskStatus.completed,
+        TaskStatus.failed,
+        TaskStatus.cancelled,
+        TaskStatus.cancel_requested,
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=f"task is terminal (status={task.status.value}), cannot advance",
+        )
     # Try to resolve dependencies
     if task.depends_on:
         all_done = all(

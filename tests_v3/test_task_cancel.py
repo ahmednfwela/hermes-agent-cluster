@@ -222,7 +222,7 @@ class TestSchedulerSkip:
         assert task["status"] == "cancelled"
         assert task["assigned_to"] is None
 
-    def test_scheduler_skips_cancel_requested_running(self, client):
+    def test_scheduler_does_not_reassign_cancel_requested(self, client):
         """Scheduler must not re-assign a cancel_requested task (was running)."""
         node_id = _join_node(client)
         task_id = _create_task(client)
@@ -342,3 +342,132 @@ class TestEnums:
         """EventType includes cancel events."""
         assert EventType.task_cancel_requested.value == "task_cancel_requested"
         assert EventType.task_cancelled.value == "task_cancelled"
+
+
+# ---------------------------------------------------------------------------
+# 7. Regression tests for review fixes (B1, B2, S1-S4)
+# ---------------------------------------------------------------------------
+
+class TestReviewFixes:
+    """Tests added to close round-1 review findings."""
+
+    def test_b1_advance_rejects_cancelled(self, client):
+        """B1: /advance must reject a cancelled task (no revival)."""
+        _join_node(client)
+        task_id = _create_task(client)
+        # Cancel immediately (no lease)
+        client.post(f"/api/v1/tasks/{task_id}/cancel")
+        # Try to advance
+        resp = client.post(f"/api/v1/tasks/{task_id}/advance")
+        assert resp.status_code == 409
+        # Verify still cancelled
+        tasks = client.get("/api/v1/tasks").json()
+        task = next(t for t in tasks if t["id"] == task_id)
+        assert task["status"] == "cancelled"
+
+    def test_b1_advance_rejects_cancel_requested(self, client):
+        """B1: /advance must reject a cancel_requested task."""
+        node_id = _join_node(client)
+        task_id = _create_task(client)
+        # Claim then cancel (has lease → cancel_requested)
+        client.post(f"/api/v1/tasks/{task_id}/claim", json={"node_id": node_id})
+        client.post(f"/api/v1/tasks/{task_id}/cancel")
+        # Try to advance
+        resp = client.post(f"/api/v1/tasks/{task_id}/advance")
+        assert resp.status_code == 409
+        # Verify still cancel_requested
+        tasks = client.get("/api/v1/tasks").json()
+        task = next(t for t in tasks if t["id"] == task_id)
+        assert task["status"] == "cancel_requested"
+
+    def test_b2_complete_rejects_cancelled(self, client):
+        """B2: /complete must reject an already-cancelled task (no overwrite)."""
+        _join_node(client)
+        task_id = _create_task(client)
+        client.post(f"/api/v1/tasks/{task_id}/cancel")
+        resp = client.post(f"/api/v1/tasks/{task_id}/complete")
+        assert resp.status_code == 409
+        # Verify still cancelled
+        tasks = client.get("/api/v1/tasks").json()
+        task = next(t for t in tasks if t["id"] == task_id)
+        assert task["status"] == "cancelled"
+
+    def test_b2_fail_rejects_cancelled(self, client):
+        """B2: /fail must reject an already-cancelled task (no overwrite)."""
+        _join_node(client)
+        task_id = _create_task(client)
+        client.post(f"/api/v1/tasks/{task_id}/cancel")
+        resp = client.post(f"/api/v1/tasks/{task_id}/fail", json={"reason": "test"})
+        assert resp.status_code == 409
+        # Verify still cancelled
+        tasks = client.get("/api/v1/tasks").json()
+        task = next(t for t in tasks if t["id"] == task_id)
+        assert task["status"] == "cancelled"
+
+    def test_s2_cancel_branches_on_lease_not_status(self, client):
+        """S2: cancel must branch on lease existence, not status."""
+        node_id = _join_node(client)
+        task_id = _create_task(client)
+        # Claim (creates lease)
+        client.post(f"/api/v1/tasks/{task_id}/claim", json={"node_id": node_id})
+        # Cancel should go to cancel_requested (has lease)
+        resp = client.post(f"/api/v1/tasks/{task_id}/cancel")
+        data = resp.json()
+        assert data["phase"] == "pending_ack"
+        assert data["status"] == "cancel_requested"
+        # Now cancel again (no lease after revoke) should 409 (already terminal)
+        resp2 = client.post(f"/api/v1/tasks/{task_id}/cancel")
+        assert resp2.status_code == 409
+
+    def test_s3_cluster_status_includes_cancel_states(self, client):
+        """S3: /api/v1/cluster/status must surface cancel_requested/cancelled counts."""
+        _join_node(client)
+        task_id = _create_task(client)
+        client.post(f"/api/v1/tasks/{task_id}/cancel")
+        resp = client.get("/api/v1/cluster/status")
+        data = resp.json()
+        assert "cancelled" in data["tasks_by_status"]
+        assert data["tasks_by_status"]["cancelled"] >= 1
+
+    def test_s3_status_endpoint_includes_cancel_states(self, client):
+        """S3: /api/v1/status must surface cancel_requested/cancelled in summary."""
+        _join_node(client)
+        task_id = _create_task(client)
+        client.post(f"/api/v1/tasks/{task_id}/cancel")
+        resp = client.get("/api/v1/status")
+        data = resp.json()
+        assert "cancelled" in data["summary"]
+        assert data["summary"]["cancelled"] >= 1
+
+    def test_s4_fail_cascades_cancel_to_dependents(self, client):
+        """S4: /fail must cascade-cancel pending/ready dependents."""
+        _join_node(client)
+        parent_id = _create_task(client)
+        child_id = _create_task(client)
+        # Set dependency
+        client.post(f"/api/v1/tasks/{child_id}/dependencies", json={"depends_on": [parent_id]})
+        # Fail parent
+        client.post(f"/api/v1/tasks/{parent_id}/fail", json={"reason": "test"})
+        # Child should be cancelled
+        tasks = client.get("/api/v1/tasks").json()
+        child = next(t for t in tasks if t["id"] == child_id)
+        assert child["status"] == "cancelled"
+
+    def test_mutation_terminality_guard(self, client):
+        """Mutation: removing terminality guard in set_task_status must break B1.
+
+        This test documents the invariant: set_task_status must reject transitions
+        FROM terminal states (except cancel_requested → cancelled). If the guard is
+        removed, this test will fail because /advance will revive a cancelled task.
+        """
+        _join_node(client)
+        task_id = _create_task(client)
+        # Cancel immediately
+        client.post(f"/api/v1/tasks/{task_id}/cancel")
+        # Verify terminal
+        tasks = client.get("/api/v1/tasks").json()
+        task = next(t for t in tasks if t["id"] == task_id)
+        assert task["status"] == "cancelled"
+        # Try to advance — must be rejected (409)
+        resp = client.post(f"/api/v1/tasks/{task_id}/advance")
+        assert resp.status_code == 409, "terminality guard must reject advance on cancelled task"

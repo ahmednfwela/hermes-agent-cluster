@@ -45,6 +45,7 @@ async def status(
 
     # Build summary
     task_counts = _state.task_counts()
+    # S3 fix: surface all task counts including cancel states
     summary = {
         "total_tasks": task_counts["total"],
         "pending": task_counts.get("pending", 0),
@@ -52,6 +53,9 @@ async def status(
         "running": task_counts.get("running", 0),
         "completed": task_counts.get("completed", 0),
         "failed": task_counts.get("failed", 0),
+        "blocked": task_counts.get("blocked", 0),
+        "cancel_requested": task_counts.get("cancel_requested", 0),
+        "cancelled": task_counts.get("cancelled", 0),
         "total_nodes": _state.node_count(),
         "online_nodes": _state.online_count(),
     }

@@ -209,6 +209,9 @@ class TestClusterStatus:
             "running": 0,
             "completed": 0,
             "failed": 0,
+            "blocked": 0,
+            "cancel_requested": 0,
+            "cancelled": 0,
         }
         assert "uptime_seconds" in data
         assert data["version"] == "python-1.0.0"
