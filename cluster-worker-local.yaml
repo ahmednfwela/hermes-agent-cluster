@@ -1,0 +1,13 @@
+cluster:
+  id: bdaya_hermes_cluster
+  role: worker
+
+node:
+  id: windows_desktop_worker
+  name: windows-desktop-worker
+  capabilities:
+    - tooling
+
+server:
+  bind: "0.0.0.0"
+  port: 8788
