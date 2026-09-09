@@ -39,11 +39,26 @@ _CONFIG_PATHS = [
 # ---------------------------------------------------------------------------
 
 def _proxy(method: str, path: str, data: dict = None) -> Any:
-    """Proxy an API call to the hermes-cluster Go service."""
+    """Proxy an API call to the hermes-cluster service.
+
+    D2b fix: signs outgoing requests via peer_auth when configured,
+    so the dashboard works with auth ON.
+    """
     url = f"{_CLUSTER_ENDPOINT}{path}"
     body = json.dumps(data).encode() if data else None
     req = Request(url, data=body, method=method)
     req.add_header("Content-Type", "application/json")
+    # D2b: sign the request when peer auth is configured
+    try:
+        from hermes_cluster.core import peer_auth
+        if peer_auth.is_configured():
+            from hermes_cluster.core.peer_auth import build_signed_path
+            signed_path = build_signed_path(url)
+            auth_headers = peer_auth.sign_request(method, signed_path, body or b"")
+            for key, value in auth_headers.items():
+                req.add_header(key, value)
+    except Exception as e:
+        logger.debug("Peer auth signing skipped: %s", e)
     try:
         with urlopen(req, timeout=10) as resp:
             raw = resp.read().decode()

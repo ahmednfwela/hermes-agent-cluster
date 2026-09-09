@@ -103,10 +103,31 @@ def _config_to_yaml(cfg: Dict[str, Any]) -> str:
 
 @router.get("")
 async def get_config(defaults: bool = Query(False, description="Return default config")):
-    """GET /api/v1/config — return current config or defaults."""
+    """GET /api/v1/config — return current config or defaults.
+
+    H1 fix: redact token fields from the response to prevent secret leakage.
+    """
     if defaults:
-        return ConfigJSON().model_dump()
-    cfg = _current_config()
+        cfg = ConfigJSON().model_dump()
+    else:
+        cfg = _current_config()
+    # H1: redact sensitive token fields
+    _redact_tokens(cfg)
+    return cfg
+
+
+def _redact_tokens(cfg: dict) -> dict:
+    """Recursively redact token fields from config dict (H1 fix)."""
+    _REDACT_KEYS = {"token", "secret", "password"}
+    if isinstance(cfg, dict):
+        for key in list(cfg.keys()):
+            if key in _REDACT_KEYS:
+                cfg[key] = "***REDACTED***"
+            else:
+                _redact_tokens(cfg[key])
+    elif isinstance(cfg, list):
+        for item in cfg:
+            _redact_tokens(item)
     return cfg
 
 
@@ -166,11 +187,15 @@ async def validate_config(cfg: Optional[ConfigJSON] = None):
 
 @router.get("/yaml")
 async def get_config_yaml(defaults: bool = Query(False, description="Return default config as YAML")):
-    """GET /api/v1/config/yaml — return config as YAML string."""
+    """GET /api/v1/config/yaml — return config as YAML string.
+
+    H1 fix: redact token fields.
+    """
     if defaults:
         cfg = ConfigJSON().model_dump()
     else:
         cfg = _current_config()
+    _redact_tokens(cfg)
 
     yaml_str = _config_to_yaml(cfg)
     return PlainTextResponse(content=yaml_str, media_type="text/yaml")

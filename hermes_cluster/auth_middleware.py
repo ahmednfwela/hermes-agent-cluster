@@ -1,55 +1,87 @@
 """FastAPI middleware that enforces peer-token auth on cross-node endpoints.
 
-Protects federation endpoints and real cross-node traffic (tasks, sync, node join/heartbeat)
-when peer tokens are configured. Other paths pass through without auth checks.
+Deny-by-default when peer auth is enabled (M2 fix): only an explicit PUBLIC
+set is accessible without authentication. Everything else requires a valid
+peer-token HMAC-SHA256 signature.
+
+Public paths (no auth required):
+  - /health
+  - /metrics
+  - /dashboard/* (static files)
+  - /docs, /redoc, /openapi.json (OpenAPI UI)
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Callable
+from typing import Callable, FrozenSet
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
 
-from .core import peer_auth
+from .core.peer_auth import PeerAuthState
 
 logger = logging.getLogger("hermes_cluster.auth_middleware")
 
+# M2: deny-by-default — only these path prefixes/exact paths are public.
+# Everything else requires peer auth when enabled.
+PUBLIC_PATHS: FrozenSet[str] = frozenset({
+    "/health",
+    "/metrics",
+    "/docs",
+    "/redoc",
+    "/openapi.json",
+})
+
+PUBLIC_PREFIXES: tuple = (
+    "/dashboard/",
+    "/dashboard/static/",
+)
+
+
+def _is_public(path: str) -> bool:
+    """Check if a path is in the public allowlist."""
+    if path in PUBLIC_PATHS:
+        return True
+    return any(path.startswith(prefix) for prefix in PUBLIC_PREFIXES)
+
 
 class PeerAuthMiddleware(BaseHTTPMiddleware):
-    """Verify peer-token HMAC-SHA256 signature on cross-node endpoints."""
+    """Verify peer-token HMAC-SHA256 signature on all non-public endpoints.
 
-    def __init__(self, app, enabled: bool = False):
+    Deny-by-default: when enabled, only PUBLIC_PATHS/PUBLIC_PREFIXES pass through.
+    All other paths require a valid peer auth signature.
+
+    H2 fix: takes a PeerAuthState instance — not module globals — so two apps
+    in one process have isolated trust domains.
+    """
+
+    def __init__(self, app, state: PeerAuthState = None, enabled: bool = False):
         super().__init__(app)
         self.enabled = enabled
+        # H2: bind state to this middleware instance, not module globals
+        self.state = state
 
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
         path = request.url.path
 
-        # Protect federation endpoints + real cross-node traffic (D2 fix)
-        # - /api/v1/federation/* (federation management)
-        # - /api/v1/tasks* (task submission/claim/complete)
-        # - /api/v1/sync/* (cross-node sync)
-        # - /api/v1/nodes/join, /api/v1/nodes/heartbeat (node registration)
         if not self.enabled:
             return await call_next(request)
 
-        requires_auth = (
-            path.startswith("/api/v1/federation/")
-            or path.startswith("/api/v1/tasks")
-            or path.startswith("/api/v1/sync/")
-            or path == "/api/v1/nodes/join"
-            or path == "/api/v1/nodes/heartbeat"
-        )
-
-        if not requires_auth:
+        # M2: deny-by-default — public paths pass through, everything else gated
+        if _is_public(path):
             return await call_next(request)
 
         # Read body for signature verification
         body = await request.body()
+
+        # M1: include query string in the path for verification
+        if request.url.query:
+            signed_path = f"{path}?{request.url.query}"
+        else:
+            signed_path = path
 
         # Extract headers
         headers = {
@@ -58,9 +90,16 @@ class PeerAuthMiddleware(BaseHTTPMiddleware):
             "X-Peer-Signature": request.headers.get("X-Peer-Signature", ""),
         }
 
-        ok, err = peer_auth.verify_request(
+        # H2: use per-instance state, not module globals
+        state = self.state
+        if state is None:
+            # Fallback to module default for backward compat
+            from .core import peer_auth
+            state = peer_auth.get_default_state()
+
+        ok, err = state.verify_request(
             method=request.method,
-            path=path,
+            path=signed_path,
             body=body,
             headers=headers,
         )
@@ -69,13 +108,10 @@ class PeerAuthMiddleware(BaseHTTPMiddleware):
             logger.warning("Peer auth failed for %s %s: %s", request.method, path, err)
             return JSONResponse(
                 status_code=401,
-                content={"error": "peer_auth_failed", "detail": err},
+                content={"error": "peer_auth_failed", "detail": "peer_auth_failed"},
             )
 
-        # Reconstruct request with body for downstream handlers
-        # (Starlette consumes the body on read, so we need to inject it back)
-        async def receive():
-            return {"type": "http.request", "body": body, "more_body": False}
-
-        request._receive = receive
+        # L3 fix: removed dead request._receive assignment.
+        # Body replay works through Starlette's _CachedRequest — proved by
+        # signed POSTs reaching handlers (tasks created, sync applied).
         return await call_next(request)
