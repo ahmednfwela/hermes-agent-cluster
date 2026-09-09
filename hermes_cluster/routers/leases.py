@@ -35,3 +35,16 @@ async def revoke_lease(lease_id: str):
 @router.get("")
 async def list_leases():
     return _state.get_active_leases()
+
+
+@router.post("/{lease_id}/extend")
+async def extend_lease(lease_id: str):
+    """Extend a lease's TTL — used by agent_executor to keep leases alive during long tasks."""
+    # Access the lease manager from state
+    lease_mgr = getattr(_state, "_lease_manager", None)
+    if not lease_mgr:
+        raise HTTPException(status_code=500, detail="lease manager not available")
+    new_lease = lease_mgr.extend(lease_id)
+    if not new_lease:
+        raise HTTPException(status_code=404, detail="lease not found or not active")
+    return new_lease

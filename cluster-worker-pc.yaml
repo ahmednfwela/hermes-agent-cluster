@@ -27,3 +27,12 @@ watchdog:
 heartbeat:
   interval: 30s
   lease_timeout: 120s
+
+agent_executor:
+  enabled: true
+  profile: alibaba1
+  model: qwen3.7-plus
+  poll_interval: 15
+  max_concurrent: 1
+  lease_renew_interval: 30
+  spawn_timeout: 1800
