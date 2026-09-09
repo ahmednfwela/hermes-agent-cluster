@@ -143,7 +143,15 @@ def start_worker_connector(
 
         # Join + heartbeat loop. Join is retried on every cycle until the
         # main accepts it (returns node_id). This handles boot-order races
-        # (worker starts before main) and main restarts.
+        # (worker starts before main).
+        #
+        # NOTE: Post-registration main restarts are NOT handled. The main's
+        # ClusterState is in-memory; after a restart, the worker's heartbeat
+        # is rejected as "unknown node" but the response is {"status":"ok"}
+        # so the connector cannot detect it. The worker remains orphaned
+        # until its own process restarts. Fixing this requires the main to
+        # return a distinguishable response (e.g. 404 or {"status":"unknown_node"})
+        # for unknown-node heartbeats, which is a separate change.
         registered_id = None
 
         while True:
