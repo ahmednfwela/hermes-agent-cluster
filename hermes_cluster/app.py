@@ -59,6 +59,7 @@ def create_app(
     node_role: str = "main",
     config_path: str = "",
     fed_token: str = "",
+    cluster_endpoint: str = "",
     static_dir: Optional[str] = None,
 ) -> FastAPI:
     """Create and configure the FastAPI application.
@@ -161,6 +162,20 @@ def create_app(
 
     # Start heartbeat for this node
     _node_manager.start_heartbeat_sender(state.node_id)
+
+    # Worker federation: when role=worker and cluster_endpoint is set,
+    # start an outbound connector that signs and POSTs join+heartbeat
+    # to the main node. Without this, the worker only updates its local
+    # store and the main never sees it.
+    if node_role == "worker" and cluster_endpoint:
+        from .core.worker_connector import start_worker_connector
+        start_worker_connector(
+            node_id=state.node_id,
+            cluster_endpoint=cluster_endpoint,
+            capabilities=[],
+            peer_token=fed_token,
+            heartbeat_interval=_node_manager._heartbeat_cfg.interval,
+        )
 
     # Store on state for router access
     state._node_manager = _node_manager

@@ -20,6 +20,7 @@ def main():
     parser.add_argument("--node-id", default="node_main", help="Node identifier")
     parser.add_argument("--node-role", default="main", choices=["main", "worker"], help="Node role")
     parser.add_argument("--fed-token", default="", help="Federation auth token")
+    parser.add_argument("--cluster-endpoint", default="", help="Main node endpoint (worker only)")
     args = parser.parse_args()
 
     # Load config from YAML if provided
@@ -34,6 +35,7 @@ def main():
                 args.cluster_id = cfg["cluster"].get("id", args.cluster_id)
                 args.node_role = cfg["cluster"].get("role", args.node_role)
                 args.fed_token = cfg["cluster"].get("token", args.fed_token)
+                args.cluster_endpoint = cfg["cluster"].get("endpoint", getattr(args, "cluster_endpoint", ""))
             if "node" in cfg:
                 args.node_id = cfg["node"].get("id", args.node_id)
             if "server" in cfg:
@@ -61,6 +63,7 @@ def main():
         node_role=args.node_role,
         config_path=config_path,
         fed_token=args.fed_token,
+        cluster_endpoint=args.cluster_endpoint,
         static_dir=static_dir if static_dir else None,
     )
 
