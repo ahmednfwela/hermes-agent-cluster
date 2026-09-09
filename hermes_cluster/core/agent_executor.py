@@ -45,7 +45,6 @@ class AgentExecutorConfig:
     model: str = "qwen3.7-plus"
     poll_interval: float = 15.0  # seconds between poll cycles
     max_concurrent: int = 1  # max simultaneous spawns
-    lease_renew_interval: float = 30.0  # seconds between lease renewals
     spawn_timeout: float = 1800.0  # max seconds per spawn (30 min)
     working_dir: str = ""  # working directory for spawned workers
     bdaya_dispatch_package: str = "@shared/bdaya-dispatch"

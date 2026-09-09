@@ -288,6 +288,55 @@ class TestAgentExecutorUnit:
             mock_proc.kill.assert_called_once()
             mock_fail.assert_called_once()
 
+    def test_claim_and_spawn_dedup_no_double_spawn(self):
+        """A task already in _active_spawns is NOT re-spawned on re-poll (B2).
+
+        Mutation: remove the dedup guard (the `task_id not in active_task_ids`
+        check in _claim_and_spawn) and this test goes RED.
+        """
+        cfg = AgentExecutorConfig(enabled=True, max_concurrent=3)
+        executor = AgentExecutor(
+            config=cfg,
+            node_id="my-node",
+            cluster_endpoint="http://127.0.0.1:9999",
+        )
+
+        # Simulate task "t1" already actively spawned
+        from hermes_cluster.core.agent_executor import ActiveSpawn
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None  # still running
+        mock_proc.pid = 99999
+        executor._active_spawns["t1"] = ActiveSpawn(
+            task_id="t1",
+            task_title="already running",
+            process=mock_proc,
+            lease_id="lease_t1",
+            started_at=time.time(),
+            lane_name="hermes-t1",
+        )
+
+        # Main returns t1 again (re-poll before completion) plus a new task t2
+        mock_tasks = [
+            {"id": "t1", "title": "already running", "status": "running",
+             "assigned_to": "my-node", "priority": 1},
+            {"id": "t2", "title": "new task", "status": "running",
+             "assigned_to": "my-node", "priority": 2},
+        ]
+
+        with patch("hermes_cluster.core.agent_executor._signed_request",
+                    return_value=mock_tasks):
+            with patch.object(executor, "_spawn_worker") as mock_spawn:
+                executor._claim_and_spawn(max_spawns=3)
+                # t1 must NOT be re-spawned; only t2 should spawn
+                spawned_ids = [call.args[0]["id"] for call in mock_spawn.call_args_list]
+                assert "t1" not in spawned_ids, (
+                    f"Dedup guard failed: t1 was re-spawned (spawned={spawned_ids})"
+                )
+                assert "t2" in spawned_ids, (
+                    f"New task t2 was not spawned (spawned={spawned_ids})"
+                )
+                assert mock_spawn.call_count == 1
+
     def test_claim_and_spawn_filters_correctly(self):
         """_claim_and_spawn only spawns for tasks assigned to this node."""
         cfg = AgentExecutorConfig(enabled=True, max_concurrent=2)

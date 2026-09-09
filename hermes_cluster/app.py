@@ -191,7 +191,6 @@ def create_app(
                 model=ae_cfg_dict.get("model", "qwen3.7-plus"),
                 poll_interval=float(ae_cfg_dict.get("poll_interval", 15)),
                 max_concurrent=int(ae_cfg_dict.get("max_concurrent", 1)),
-                lease_renew_interval=float(ae_cfg_dict.get("lease_renew_interval", 30)),
                 spawn_timeout=float(ae_cfg_dict.get("spawn_timeout", 1800)),
                 working_dir=ae_cfg_dict.get("working_dir", ""),
             )

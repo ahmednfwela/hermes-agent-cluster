@@ -7,6 +7,7 @@ This avoids needing a real bdaya-dispatch spawn (which would cost credits and re
 a live worker restart). The real spawn is validated by the unit tests mocking subprocess.Popen.
 
 Run:
+    pytest tests_v3/test_e2e_agent_executor.py -v
     python tests_v3/test_e2e_agent_executor.py
 """
 
@@ -18,6 +19,8 @@ import threading
 import subprocess
 from pathlib import Path
 from urllib.request import Request, urlopen
+
+import pytest
 
 # Fix Windows console encoding
 os.environ["PYTHONIOENCODING"] = "utf-8"
@@ -176,7 +179,7 @@ def test_e2e_lifecycle():
     # 8. Run another poll cycle — should reap the finished spawn and report completion
     executor._poll_once()
 
-    # 9. Check final task state
+    # 9. Check final task state — ASSERT the outcome (B1 fix)
     final_tasks = main_client.get("/api/v1/tasks").json()
     final_task = next((t for t in final_tasks if t["id"] == task_id), None)
     print(f"[OK] Final task state: status={final_task['status']}")
@@ -188,18 +191,23 @@ def test_e2e_lifecycle():
     main_lm.stop()
     main_nm.stop_watchdog()
 
-    if final_task["status"] == "completed":
-        print()
-        print("=== E2E TEST PASSED ===")
-        print(f"Task {task_id} went: pending -> ready -> running -> completed")
-        print("Executor spawned mock worker, reaped it, reported completion.")
-        return True
-    else:
-        print()
-        print(f"=== E2E TEST FAILED (status={final_task['status']}) ===")
-        return False
+    # CRITICAL ASSERTIONS — mutation "remove _report_completion" must fail here
+    assert final_task is not None, "Task disappeared from state"
+    assert final_task["status"] == "completed", (
+        f"Task should be completed, got {final_task['status']}"
+    )
+
+    print()
+    print("=== E2E TEST PASSED ===")
+    print(f"Task {task_id} went: pending -> ready -> running -> completed")
+    print("Executor spawned mock worker, reaped it, reported completion.")
 
 
 if __name__ == "__main__":
-    success = test_e2e_lifecycle()
-    sys.exit(0 if success else 1)
+    try:
+        test_e2e_lifecycle()
+        print("\nAll assertions passed.")
+        sys.exit(0)
+    except AssertionError as e:
+        print(f"\nAssertion failed: {e}")
+        sys.exit(1)
