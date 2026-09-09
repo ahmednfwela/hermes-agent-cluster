@@ -90,6 +90,38 @@ def _get_plugin_config() -> Dict[str, Any]:
 # Server lifecycle
 # ---------------------------------------------------------------------------
 
+def _parse_peer_tokens(raw: str) -> Dict[str, str]:
+    """Parse "node_id:token,node_id:token" (same shape app.py reads from PEER_TOKENS)."""
+    out: Dict[str, str] = {}
+    for item in (raw or "").split(","):
+        item = item.strip()
+        if ":" in item:
+            node_id, token = item.split(":", 1)
+            if node_id.strip() and token.strip():
+                out[node_id.strip()] = token.strip()
+    return out
+
+
+def _configure_peer_auth(config: Dict[str, Any]) -> bool:
+    """Configure module-level peer-auth signing for THIS process (plugin-only mode).
+
+    In auto_start=false mode no server is created in-process, so nothing else
+    ever calls peer_auth.configure(); without this every _api_call is unsigned
+    and an auth-ON main answers 401. Returns True when signing was configured.
+    """
+    token = config.get("token") or ""
+    if not token:
+        return False
+    try:
+        from hermes_cluster.core import peer_auth
+        peers = _parse_peer_tokens(os.environ.get("PEER_TOKENS", ""))
+        peer_auth.configure(config.get("node_id", DEFAULT_NODE_ID), token, peers or None)
+        return True
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning("Peer auth configure failed: %s", e)
+        return False
+
+
 def _start_server(config: Dict[str, Any]) -> bool:
     """Start the Python FastAPI server in a background thread."""
     global _server_thread, _base_url
@@ -418,6 +450,7 @@ def _on_session_end(**kwargs) -> None:
 
 def register(ctx) -> None:
     """Register cluster tools with Hermes Agent."""
+    _configure_peer_auth(_get_plugin_config())
     for name, schema in SCHEMAS.items():
         ctx.register_tool(
             name=name,
