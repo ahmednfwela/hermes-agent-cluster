@@ -97,25 +97,55 @@ async def fail_task(task_id: str, req: FailTaskRequest = None):
         _state.set_task_status(task_id, TaskStatus.cancelled, fail_reason=reason)
         return {"status": "cancelled", "blocked": []}
 
+    # N2 fix: revoke lease on /fail (same as /complete does)
+    if _lease_manager:
+        lease = _lease_manager.get_by_task(task_id)
+        if lease:
+            _lease_manager.revoke(lease.id)
+
     _state.set_task_status(task_id, TaskStatus.failed, fail_reason=reason)
-    # S4 fix: cascade-cancel dependents that are still pending/ready/blocked
-    blocked = _state.get_dependents(task_id)
-    for dep_id in blocked:
-        dep_task = _state.get_task(dep_id)
-        if dep_task and dep_task.status in (TaskStatus.pending, TaskStatus.ready, TaskStatus.blocked):
-            _state.set_task_status(dep_id, TaskStatus.cancelled, fail_reason=f"parent {task_id} failed")
+    # S4 fix: transitive cascade-cancel ALL non-terminal dependents
+    blocked = _cascade_cancel_dependents(task_id, f"parent {task_id} failed")
     return {"status": "failed", "blocked": blocked}
+
+
+def _cascade_cancel_dependents(task_id: str, reason: str) -> list:
+    """S4 fix: transitively cancel ALL non-terminal dependents of task_id.
+
+    Walks the dependent tree depth-first. Cancels any dependent that is not
+    already terminal (completed/failed/cancelled/cancel_requested). Running
+    dependents get their leases revoked and are set to cancel_requested.
+    Returns list of all dependent task_ids found (for API compatibility).
+    """
+    all_dependents = _state.get_trigger_chain(task_id)  # transitive, depth-first
+    for dep_id in all_dependents:
+        dep_task = _state.get_task(dep_id)
+        if not dep_task:
+            continue
+        terminal = {TaskStatus.completed, TaskStatus.failed, TaskStatus.cancelled, TaskStatus.cancel_requested}
+        if dep_task.status in terminal:
+            continue
+        # Running tasks with a lease → cancel_requested (two-phase); others → cancelled immediately
+        if dep_task.status == TaskStatus.running or dep_task.status == TaskStatus.cancel_requested:
+            lease = _lease_manager.get_by_task(dep_id) if _lease_manager else None
+            if lease:
+                _lease_manager.revoke(lease.id)
+            _state.set_task_status(dep_id, TaskStatus.cancel_requested, fail_reason=reason)
+        else:
+            _state.set_task_status(dep_id, TaskStatus.cancelled, fail_reason=reason)
+    return all_dependents
 
 
 @router.post("/{task_id}/cancel")
 async def cancel_task(task_id: str, req: CancelTaskRequest = None):
     """Cancel a task — two-phase for running tasks, immediate for unclaimed.
 
-    Mirrors the /fail handler structure:
-    - Unclaimed (pending/ready) → cancelled immediately
-    - Claimed/running → lease revoked, → cancel_requested; worker's next
+    Branching is on lease existence (S2), not status:
+    - No lease → cancelled immediately (regardless of status)
+    - Has lease → lease revoked, → cancel_requested; worker's next
       /complete or /fail closes to cancelled
     - Terminal (completed/failed/cancelled/cancel_requested) → 409
+    After a successful cancel, transitively cancels all non-terminal dependents (S4).
     """
     task = _state.get_task(task_id)
     if not task:
@@ -140,11 +170,15 @@ async def cancel_task(task_id: str, req: CancelTaskRequest = None):
     lease = _lease_manager.get_by_task(task_id) if _lease_manager else None
     if lease is None:
         _state.set_task_status(task_id, TaskStatus.cancelled, fail_reason=reason)
+        # S4 fix: cascade-cancel dependents
+        _cascade_cancel_dependents(task_id, f"parent {task_id} cancelled")
         return {"status": "cancelled", "phase": "immediate"}
 
     # Has lease → revoke it, → cancel_requested
     _lease_manager.revoke(lease.id)
     _state.set_task_status(task_id, TaskStatus.cancel_requested, fail_reason=reason)
+    # S4 fix: cascade-cancel dependents
+    _cascade_cancel_dependents(task_id, f"parent {task_id} cancelled")
     return {"status": "cancel_requested", "phase": "pending_ack"}
 
 
@@ -272,7 +306,16 @@ async def release_task(task_id: str, req: ReleaseTaskRequest):
         if lease:
             _lease_manager.revoke(lease.id)
 
-    _state.set_task_status(task_id, TaskStatus.ready)
+    # S7 fix: honor the terminality guard — if set_task_status rejects the
+    # transition (e.g. cancel_requested/cancelled), don't clear assigned_to
+    # and return the current state rather than reporting a transition that
+    # didn't happen.
+    transitioned = _state.set_task_status(task_id, TaskStatus.ready)
+    if not transitioned:
+        # Guard rejected — task is in a terminal state. Return current state as-is.
+        released_task = _state.get_task(task_id)
+        return released_task.model_dump()
+
     with _state._tasks_lock:
         t = _state._tasks[task_id]
         t.assigned_to = None

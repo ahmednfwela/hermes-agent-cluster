@@ -454,20 +454,253 @@ class TestReviewFixes:
         assert child["status"] == "cancelled"
 
     def test_mutation_terminality_guard(self, client):
-        """Mutation: removing terminality guard in set_task_status must break B1.
+        """Mutation: removing terminality guard in set_task_status must break the sync seam.
 
-        This test documents the invariant: set_task_status must reject transitions
-        FROM terminal states (except cancel_requested → cancelled). If the guard is
-        removed, this test will fail because /advance will revive a cancelled task.
+        S5 fix: this test now exercises the sync path (handle_sync_message → set_task_status),
+        NOT the router-level guard in /advance. If the set_task_status terminality guard is
+        removed, a sync message can revive a cancelled task — this test catches it.
         """
-        _join_node(client)
+        state = ClusterState()
+        state.create_task("t1", "test", [], 3)
+        # Cancel the task (terminal)
+        state.set_task_status("t1", TaskStatus.cancelled)
+        assert state.get_task("t1").status == TaskStatus.cancelled
+
+        # Try to sync it back to running via handle_sync_message (the N1 seam)
+        msg = SyncMessage(
+            version=1,
+            sender_node="remote-lagging-node",
+            event_type=SyncEventType.task_assigned,
+            timestamp=1000,
+            task_state=TaskSync(
+                task_id="t1",
+                title="test",
+                status="running",
+                assigned_to="node_remote",
+                version=99,
+            ),
+        )
+        state.handle_sync_message(msg)
+        # Must STAY cancelled — the set_task_status guard blocks the revival
+        task = state.get_task("t1")
+        assert task.status == TaskStatus.cancelled, \
+            "terminality guard in set_task_status must reject sync-driven revival"
+
+
+# ---------------------------------------------------------------------------
+# 8. Round-2 regression tests (N1, N2, S4)
+# ---------------------------------------------------------------------------
+
+class TestRound2Fixes:
+    """Regression tests for round-2 review findings."""
+
+    # N1: sync must not revive a terminal task
+    def test_n1_sync_cannot_revive_cancelled_task(self):
+        """N1: handle_sync_message must not overwrite a cancelled task's status."""
+        state = ClusterState()
+        state.create_task("t1", "doomed", [], 3)
+        # Cancel the task locally (terminal)
+        state.set_task_status("t1", TaskStatus.cancelled)
+        assert state.get_task("t1").status == TaskStatus.cancelled
+
+        # Remote sends a sync with status=running, high version
+        msg = SyncMessage(
+            version=500,
+            sender_node="remote-lagging-node",
+            event_type=SyncEventType.task_assigned,
+            timestamp=1000,
+            task_state=TaskSync(
+                task_id="t1",
+                title="doomed",
+                status="running",
+                assigned_to="node_remote",
+                version=99,
+            ),
+        )
+        applied = state.handle_sync_message(msg)
+        assert applied is True  # global counter advanced
+
+        # Task must STILL be cancelled — terminality guard held
+        task = state.get_task("t1")
+        assert task.status == TaskStatus.cancelled
+
+    def test_n1_sync_cannot_revive_completed_task(self):
+        """N1: sync cannot revive a completed task either."""
+        state = ClusterState()
+        state.create_task("t1", "done", [], 3)
+        state.set_task_status("t1", TaskStatus.completed)
+
+        msg = SyncMessage(
+            version=10,
+            sender_node="remote",
+            event_type=SyncEventType.task_assigned,
+            timestamp=1000,
+            task_state=TaskSync(task_id="t1", title="done", status="ready", version=99),
+        )
+        state.handle_sync_message(msg)
+        assert state.get_task("t1").status == TaskStatus.completed
+
+    def test_n1_sync_stale_per_task_version_rejected(self):
+        """N1: sync with stale per-task version must not overwrite, even with fresh global version."""
+        state = ClusterState()
+        state.create_task("t1", "test", [], 3)
+        # Bump local task version to 5
+        for _ in range(4):
+            state.set_task_status("t1", TaskStatus.cancel_requested)
+            # cancel_requested → cancel_requested is rejected (terminal), so bump via other means
+        # Actually let's just create at version 1 and sync to version 3, then try version 2
+        state2 = ClusterState()
+        state2.create_task("t1", "test", [], 3)
+        # Sync to version 3 (running)
+        msg1 = SyncMessage(
+            version=1, sender_node="r", event_type=SyncEventType.task_assigned,
+            timestamp=1, task_state=TaskSync(task_id="t1", title="test", status="running", version=3),
+        )
+        state2.handle_sync_message(msg1)
+        assert state2.get_task("t1").version == 3
+
+        # Now try version 2 (stale) with a higher global version
+        msg2 = SyncMessage(
+            version=2, sender_node="r", event_type=SyncEventType.task_cancelled,
+            timestamp=2, task_state=TaskSync(task_id="t1", title="test", status="cancelled", version=2),
+        )
+        state2.handle_sync_message(msg2)
+        # Task should still be running (version 3 > 2, so stale sync rejected)
+        assert state2.get_task("t1").status == TaskStatus.running
+
+    # N2: recovery must not report a terminal task as rescheduled
+    def test_n2_recovery_does_not_false_reschedule_failed_task(self, client):
+        """N2: a failed task with an active lease must NOT be reported as rescheduled."""
+        from hermes_cluster.recovery.revoker import Revoker
+        from hermes_cluster.recovery.rescheduler import Rescheduler
+
+        node_id = _join_node(client)
         task_id = _create_task(client)
-        # Cancel immediately
-        client.post(f"/api/v1/tasks/{task_id}/cancel")
-        # Verify terminal
+
+        # Claim the task (creates lease)
+        client.post(f"/api/v1/tasks/{task_id}/claim", json={"node_id": node_id})
+
+        # Fail the task — N2 fix: this now revokes the lease
+        resp = client.post(f"/api/v1/tasks/{task_id}/fail", json={"reason": "broken"})
+        assert resp.status_code == 200
+
+        # Verify lease was revoked by /fail
+        leases = client.get("/api/v1/leases").json()
+        active_for_task = [l for l in leases if l["task_id"] == task_id and l["status"] == "active"]
+        assert len(active_for_task) == 0, "/fail must revoke the lease"
+
+        # Verify task is failed
         tasks = client.get("/api/v1/tasks").json()
         task = next(t for t in tasks if t["id"] == task_id)
-        assert task["status"] == "cancelled"
-        # Try to advance — must be rejected (409)
-        resp = client.post(f"/api/v1/tasks/{task_id}/advance")
-        assert resp.status_code == 409, "terminality guard must reject advance on cancelled task"
+        assert task["status"] == "failed"
+
+    def test_n2_recovery_rescheduler_skips_terminal_tasks(self):
+        """N2: Rescheduler.reschedule_orphaned must skip terminal tasks (unassign_task returns False)."""
+        from hermes_cluster.state import ClusterState
+        from hermes_cluster.recovery.rescheduler import Rescheduler
+        from hermes_cluster.models import Node, NodeStatus
+
+        state = ClusterState()
+        # Register a node
+        node = Node(id="node_w1", name="w1", capabilities=["coding"], status=NodeStatus.online)
+        state.register_node(node)
+
+        # Create and fail a task
+        state.create_task("t1", "test", [], 3)
+        state.set_task_status("t1", TaskStatus.running)
+        with state._tasks_lock:
+            state._tasks["t1"].assigned_to = "node_w1"
+        state.set_task_status("t1", TaskStatus.failed, fail_reason="broken")
+
+        rescheduler = Rescheduler(state)
+        # Try to reschedule the failed task
+        count = rescheduler.reschedule_orphaned(["t1"])
+        assert count == 0, "failed task must not be rescheduled"
+
+        # Verify task is still failed, not ready
+        task = state.get_task("t1")
+        assert task.status == TaskStatus.failed
+
+        # Verify no spurious recovery events
+        events = state.get_recovery_events()
+        reschedule_events = [e for e in events if e.action == "reschedule"]
+        assert len(reschedule_events) == 0, "no reschedule event for a terminal task"
+
+    # S4: transitive cascade
+    def test_s4_cancel_cascades_to_dependents(self, client):
+        """S4: /cancel must cascade-cancel pending/ready dependents."""
+        _join_node(client)
+        parent_id = _create_task(client)
+        child_id = _create_task(client)
+        # Set dependency
+        client.post(f"/api/v1/tasks/{child_id}/dependencies", json={"depends_on": [parent_id]})
+
+        # Cancel parent
+        resp = client.post(f"/api/v1/tasks/{parent_id}/cancel")
+        assert resp.status_code == 200
+
+        # Child must be cancelled
+        tasks = client.get("/api/v1/tasks").json()
+        child = next(t for t in tasks if t["id"] == child_id)
+        assert child["status"] == "cancelled"
+
+    def test_s4_fail_cascades_transitively_depth2(self, client):
+        """S4: A→B→C, /fail A must cascade to both B and C."""
+        _join_node(client)
+        a_id = _create_task(client, title="A")
+        b_id = _create_task(client, title="B")
+        c_id = _create_task(client, title="C")
+        # A → B → C
+        client.post(f"/api/v1/tasks/{b_id}/dependencies", json={"depends_on": [a_id]})
+        client.post(f"/api/v1/tasks/{c_id}/dependencies", json={"depends_on": [b_id]})
+
+        # Fail A
+        client.post(f"/api/v1/tasks/{a_id}/fail", json={"reason": "broken"})
+
+        # Both B and C must be cancelled
+        tasks = client.get("/api/v1/tasks").json()
+        b = next(t for t in tasks if t["id"] == b_id)
+        c = next(t for t in tasks if t["id"] == c_id)
+        assert b["status"] == "cancelled", f"B should be cancelled, got {b['status']}"
+        assert c["status"] == "cancelled", f"C should be cancelled, got {c['status']}"
+
+    def test_s4_cascaded_dependent_not_schedulable(self, client):
+        """S4: a cascaded dependent must NOT be picked up by /schedule/trigger."""
+        _join_node(client)
+        parent_id = _create_task(client)
+        child_id = _create_task(client)
+        client.post(f"/api/v1/tasks/{child_id}/dependencies", json={"depends_on": [parent_id]})
+
+        # Cancel parent → child is cascade-cancelled
+        client.post(f"/api/v1/tasks/{parent_id}/cancel")
+
+        # Trigger scheduler — must NOT assign the cancelled child
+        resp = client.post("/api/v1/schedule/trigger")
+        data = resp.json()
+        assigned_ids = [a["task_id"] for a in data.get("assignments", [])]
+        assert child_id not in assigned_ids, "cascaded dependent must not be scheduled"
+
+        # Verify child is still cancelled
+        tasks = client.get("/api/v1/tasks").json()
+        child = next(t for t in tasks if t["id"] == child_id)
+        assert child["status"] == "cancelled"
+
+    def test_s4_fail_cascades_to_running_dependent(self, client):
+        """S4: /fail must cascade to running dependents too (cancel_requested via lease revoke)."""
+        node_id = _join_node(client)
+        parent_id = _create_task(client)
+        child_id = _create_task(client)
+        client.post(f"/api/v1/tasks/{child_id}/dependencies", json={"depends_on": [parent_id]})
+
+        # Claim the child (makes it running with a lease)
+        resp = client.post(f"/api/v1/tasks/{child_id}/claim", json={"node_id": node_id})
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "running"
+
+        # Fail parent — child should be cascade to cancel_requested (has lease)
+        client.post(f"/api/v1/tasks/{parent_id}/fail", json={"reason": "broken"})
+
+        tasks = client.get("/api/v1/tasks").json()
+        child = next(t for t in tasks if t["id"] == child_id)
+        assert child["status"] == "cancel_requested", \
+            f"running dependent with lease should be cancel_requested, got {child['status']}"

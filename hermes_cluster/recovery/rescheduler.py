@@ -50,9 +50,10 @@ class Rescheduler:
             if task is None:
                 continue
 
-            # Atomically unassign the task and set it back to ready
-            # Uses the public API instead of accessing internal state
-            self._state.unassign_task(task_id)
+            # N2 fix: check unassign_task return — terminal tasks (failed/cancelled)
+            # must NOT be rescheduled. unassign_task returns False for terminal tasks.
+            if not self._state.unassign_task(task_id):
+                continue
 
             # Try to schedule it
             scheduled = self._state.schedule_pending()
