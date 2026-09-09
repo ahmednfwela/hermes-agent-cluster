@@ -60,6 +60,7 @@ def create_app(
     config_path: str = "",
     fed_token: str = "",
     cluster_endpoint: str = "",
+    node_capabilities: Optional[list] = None,
     static_dir: Optional[str] = None,
 ) -> FastAPI:
     """Create and configure the FastAPI application.
@@ -172,9 +173,8 @@ def create_app(
         start_worker_connector(
             node_id=state.node_id,
             cluster_endpoint=cluster_endpoint,
-            capabilities=[],
+            capabilities=node_capabilities or [],
             peer_token=fed_token,
-            heartbeat_interval=_node_manager._heartbeat_cfg.interval,
         )
 
     # Store on state for router access

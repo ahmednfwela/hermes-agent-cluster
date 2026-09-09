@@ -38,6 +38,7 @@ def main():
                 args.cluster_endpoint = cfg["cluster"].get("endpoint", getattr(args, "cluster_endpoint", ""))
             if "node" in cfg:
                 args.node_id = cfg["node"].get("id", args.node_id)
+                args.node_capabilities = cfg["node"].get("capabilities", [])
             if "server" in cfg:
                 args.port = cfg["server"].get("port", args.port)
                 args.host = cfg["server"].get("bind", args.host)
@@ -64,6 +65,7 @@ def main():
         config_path=config_path,
         fed_token=args.fed_token,
         cluster_endpoint=args.cluster_endpoint,
+        node_capabilities=getattr(args, "node_capabilities", []),
         static_dir=static_dir if static_dir else None,
     )
 

@@ -2,16 +2,21 @@
 
 When a node runs with role=worker and cluster.endpoint is set, this module
 starts a background thread that:
-  1. POSTs a signed /api/v1/nodes/join to the main on startup
+  1. POSTs a signed /api/v1/nodes/join to the main (retried until successful)
   2. Periodically POSTs signed /api/v1/nodes/heartbeat
+
+The heartbeat interval MUST be significantly shorter than the main's
+watchdog degraded_after threshold (default 15s) to avoid flapping between
+online/degraded. The default 10s interval gives 5s margin below the 15s
+degraded threshold and 20s margin below the 30s offline threshold.
 
 Without this, the worker's heartbeat sender only updates the LOCAL
 in-memory store and the main node never sees the worker.
 
 The peer token is resolved in priority order:
-  1. The `peer_token` argument (from cluster.token in config)
-  2. PEER_TOKEN environment variable
-  3. ~/.config/bdaya/hermes-peer-token file
+  1. PEER_TOKEN environment variable (matches app.py's resolution)
+  2. ~/.config/bdaya/hermes-peer-token file (Bdaya fleet convention)
+  3. The `peer_token` argument (from cluster.token in config)
 """
 
 from __future__ import annotations
@@ -31,9 +36,11 @@ logger = logging.getLogger(__name__)
 
 
 def _resolve_peer_token(explicit: str = "") -> str:
-    """Resolve the peer token for signing outbound requests."""
-    if explicit:
-        return explicit
+    """Resolve the peer token for signing outbound requests.
+
+    Resolution order matches app.py:92 (env first) to ensure connector
+    and plugin signer present the same token to main's per-node map.
+    """
     import os
     env_token = os.environ.get("PEER_TOKEN", "")
     if env_token:
@@ -42,6 +49,8 @@ def _resolve_peer_token(explicit: str = "") -> str:
     token_path = Path.home() / ".config" / "bdaya" / "hermes-peer-token"
     if token_path.is_file():
         return token_path.read_text().strip()
+    if explicit:
+        return explicit
     return ""
 
 
@@ -95,7 +104,7 @@ def start_worker_connector(
     cluster_endpoint: str,
     capabilities: List[str],
     peer_token: str = "",
-    heartbeat_interval: float = 30.0,
+    heartbeat_interval: float = 10.0,
 ) -> None:
     """Start the outbound worker connector thread.
 
@@ -104,9 +113,10 @@ def start_worker_connector(
     Args:
         node_id: this worker's node ID
         cluster_endpoint: main node URL (e.g. http://127.0.0.1:8787)
-        capabilities: list of capability strings
+        capabilities: list of capability strings (from config)
         peer_token: shared secret for signing (resolved from env/file if empty)
-        heartbeat_interval: seconds between heartbeat POSTs
+        heartbeat_interval: seconds between heartbeat POSTs. MUST be < main's
+            watchdog degraded_after (default 15s). Default 10s gives safe margin.
     """
     global _connector_started
     with _connector_lock:
@@ -127,39 +137,46 @@ def start_worker_connector(
 
     def _loop():
         logger.info(
-            "worker connector started: node=%s endpoint=%s interval=%.1fs",
-            node_id, cluster_endpoint, heartbeat_interval,
+            "worker connector started: node=%s endpoint=%s interval=%.1fs caps=%s",
+            node_id, cluster_endpoint, heartbeat_interval, capabilities,
         )
 
-        # Initial join — the main's /join endpoint prepends "node_" to node_name
-        join_data = {
-            "node_name": node_id,
-            "capabilities": capabilities,
-            "endpoint": f"http://{node_id}:0",  # worker's own address (informational)
-        }
-        result = _signed_post(
-            cluster_endpoint, "/api/v1/nodes/join", join_data, token, node_id
-        )
-        # Track the registered node_id (main prepends "node_" to node_name)
-        registered_id = node_id
-        if result and "node_id" in result:
-            registered_id = result["node_id"]
-            logger.info("worker connector: join succeeded, registered as %s", registered_id)
-        else:
-            logger.warning("worker connector: initial join failed — will retry via heartbeat")
-            # Fallback: assume the main uses "node_" + our node_id
-            registered_id = f"node_{node_id}"
+        # Join + heartbeat loop. Join is retried on every cycle until the
+        # main accepts it (returns node_id). This handles boot-order races
+        # (worker starts before main) and main restarts.
+        registered_id = None
 
-        # Periodic heartbeat — use the registered node_id
-        stop_event = threading.Event()
-        while not stop_event.is_set():
-            stop_event.wait(timeout=heartbeat_interval)
-            if stop_event.is_set():
-                break
-            hb_data = {"node_id": registered_id}
-            _signed_post(
-                cluster_endpoint, "/api/v1/nodes/heartbeat", hb_data, token, node_id
-            )
+        while True:
+            # Try join if not yet registered
+            if registered_id is None:
+                join_data = {
+                    "node_name": node_id,
+                    "capabilities": capabilities,
+                    "endpoint": f"http://{node_id}:0",
+                }
+                result = _signed_post(
+                    cluster_endpoint, "/api/v1/nodes/join", join_data, token, node_id
+                )
+                if result and "node_id" in result:
+                    registered_id = result["node_id"]
+                    logger.info(
+                        "worker connector: join succeeded, registered as %s",
+                        registered_id,
+                    )
+                else:
+                    logger.warning(
+                        "worker connector: join failed, will retry in %.1fs",
+                        heartbeat_interval,
+                    )
+
+            # Send heartbeat if registered
+            if registered_id is not None:
+                hb_data = {"node_id": registered_id}
+                _signed_post(
+                    cluster_endpoint, "/api/v1/nodes/heartbeat", hb_data, token, node_id
+                )
+
+            time.sleep(heartbeat_interval)
 
     thread = threading.Thread(target=_loop, daemon=True, name=f"worker-connector-{node_id}")
     thread.start()
