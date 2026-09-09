@@ -42,3 +42,17 @@ def test_register_configures_signing(monkeypatch):
     ctx = Ctx(); plugin.register(ctx)
     assert any(n.startswith("kanban_cluster_") for n in ctx.tools)
     assert peer_auth.get_default_state().local_node_id == "node_reg"
+
+
+def test_register_sets_base_url_in_attach_mode(monkeypatch):
+    monkeypatch.setenv("HERMES_CLUSTER_AUTO_START", "false")
+    monkeypatch.setenv("HERMES_CLUSTER_PORT", "8787")
+    monkeypatch.setenv("HERMES_CLUSTER_TOKEN", "tok-url")
+    monkeypatch.setattr(plugin, "_base_url", "")
+
+    class Ctx:
+        def register_tool(self, **kw): pass
+        def register_hook(self, *a, **kw): pass
+
+    plugin.register(Ctx())
+    assert plugin._base_url == "http://127.0.0.1:8787"

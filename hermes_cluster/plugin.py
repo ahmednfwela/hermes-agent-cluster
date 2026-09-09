@@ -122,6 +122,19 @@ def _configure_peer_auth(config: Dict[str, Any]) -> bool:
         return False
 
 
+def _ensure_base_url(config: Dict[str, Any]) -> str:
+    """Set the module base URL from config when no in-process server is started.
+
+    _start_server() used to be the only place that set _base_url, so in
+    auto_start=false (attach-to-existing-main) mode every _api_call was built
+    from an empty base and urlopen raised "unknown url type: '/api/v1/...'".
+    """
+    global _base_url
+    if not _base_url:
+        _base_url = f"http://127.0.0.1:{config.get('port', DEFAULT_PORT)}"
+    return _base_url
+
+
 def _start_server(config: Dict[str, Any]) -> bool:
     """Start the Python FastAPI server in a background thread."""
     global _server_thread, _base_url
@@ -450,7 +463,9 @@ def _on_session_end(**kwargs) -> None:
 
 def register(ctx) -> None:
     """Register cluster tools with Hermes Agent."""
-    _configure_peer_auth(_get_plugin_config())
+    _cfg = _get_plugin_config()
+    _ensure_base_url(_cfg)
+    _configure_peer_auth(_cfg)
     for name, schema in SCHEMAS.items():
         ctx.register_tool(
             name=name,
