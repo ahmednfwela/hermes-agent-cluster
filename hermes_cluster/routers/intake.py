@@ -91,7 +91,16 @@ async def webhook(request: Request):
     webhook_secret = os.environ.get("GITLAB_INTAKE_WEBHOOK_SECRET", "")
     if webhook_secret:
         token = request.headers.get("X-Gitlab-Token", "")
-        if not hmac.compare_digest(token, webhook_secret):
+        # R3-2 fix: hmac.compare_digest raises TypeError on non-ASCII str,
+        # which would 500 the auth check. Compare as bytes to accept any token.
+        try:
+            ok = hmac.compare_digest(
+                token.encode("utf-8"),
+                webhook_secret.encode("utf-8"),
+            )
+        except (TypeError, UnicodeDecodeError):
+            ok = False
+        if not ok:
             logger.warning("Webhook rejected: invalid or missing X-Gitlab-Token")
             raise HTTPException(status_code=401, detail="Invalid webhook token")
 
@@ -110,8 +119,9 @@ async def webhook(request: Request):
         return {"status": "ignored", "reason": f"action={action}"}
 
     issue_iid = attrs.get("iid")
-    # Validate iid is an integer (prevents None-key collision in dedup map)
-    if not isinstance(issue_iid, int):
+    # Validate iid is an integer (prevents None-key collision in dedup map).
+    # type(iid) is int rejects bool (True==1 would collide with real issue #1).
+    if type(issue_iid) is not int:
         logger.warning("Webhook rejected: missing or non-integer iid=%r", issue_iid)
         raise HTTPException(status_code=400, detail=f"Invalid or missing iid: {issue_iid!r}")
 

@@ -203,3 +203,70 @@ async def test_webhook_iid_validation_non_integer(app):
         resp = await client.post("/api/v1/intake/gitlab/webhook", json=payload)
         assert resp.status_code == 400
         assert "Invalid or missing iid" in resp.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# Round-3 regression tests (R3-2, iid bool)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_r3_2_non_ascii_token_returns_401_not_500():
+    """R3-2: non-ASCII X-Gitlab-Token must return 401, not 500 (TypeError).
+
+    hmac.compare_digest(str, str) raises TypeError on non-ASCII chars.
+    Fix: compare as bytes so any token is safely handled.
+    """
+    os.environ["GITLAB_INTAKE_WEBHOOK_SECRET"] = "correct-secret"
+    try:
+        app = create_app(cluster_id="test", node_id="test-node", node_role="main")
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            payload = {
+                "object_kind": "issue",
+                "object_attributes": {
+                    "iid": 444,
+                    "title": "Test non-ASCII token",
+                    "action": "open",
+                },
+                "labels": [{"title": "tooling"}],
+            }
+            # Send a token with latin-1 byte 0xE9 (é) — non-ASCII.
+            # httpx can't send non-ASCII header values directly, so we pass
+            # raw bytes via the header tuple form.
+            non_ascii_token_bytes = b"forg\xe9d-token"
+            resp = await client.post(
+                "/api/v1/intake/gitlab/webhook",
+                json=payload,
+                headers=[(b"x-gitlab-token", non_ascii_token_bytes)],
+            )
+            # Must be 401 (auth rejected), NOT 500 (TypeError unhandled)
+            assert resp.status_code == 401, \
+                f"non-ASCII token must return 401, got {resp.status_code}"
+            assert "Invalid webhook token" in resp.json()["detail"]
+    finally:
+        os.environ.pop("GITLAB_INTAKE_WEBHOOK_SECRET", None)
+
+
+@pytest.mark.asyncio
+async def test_iid_bool_rejected():
+    """iid: bool must be rejected (True==1 would collide with real issue #1).
+
+    type(iid) is int rejects bool; isinstance(True, int) is True (bool subclasses int).
+    """
+    app = create_app(cluster_id="test", node_id="test-node", node_role="main")
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        payload = {
+            "object_kind": "issue",
+            "object_attributes": {
+                "iid": True,  # bool, not int
+                "title": "Test with bool iid",
+                "action": "open",
+            },
+            "labels": [{"title": "tooling"}],
+        }
+        resp = await client.post("/api/v1/intake/gitlab/webhook", json=payload)
+        assert resp.status_code == 400, \
+            f"bool iid must be rejected with 400, got {resp.status_code}"
+        assert "Invalid or missing iid" in resp.json()["detail"]
