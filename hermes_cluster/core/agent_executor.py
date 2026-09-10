@@ -42,12 +42,12 @@ class AgentExecutorConfig:
     """Configuration for the agent executor."""
     enabled: bool = False
     profile: str = "alibaba1"
-    model: str = "qwen3.7-plus"
+    model: str = "sonnet"
     poll_interval: float = 15.0  # seconds between poll cycles
     max_concurrent: int = 1  # max simultaneous spawns
     spawn_timeout: float = 1800.0  # max seconds per spawn (30 min)
     working_dir: str = ""  # working directory for spawned workers
-    bdaya_dispatch_package: str = "@shared/bdaya-dispatch"
+    bdaya_dispatch_package: str = "@shared/bdaya-dispatch@latest"
 
 
 # ---------------------------------------------------------------------------
@@ -335,8 +335,20 @@ class AgentExecutor:
             "--name", lane_name,
             "--goal", goal,
             "--model", self._config.model,
+            "--profile", self._config.profile,
             "--require-goal",
+            "--force",
         ]
+
+        # bdaya-dispatch resolves the CALLER's cpm profile from CLAUDE_CONFIG_DIR and
+        # refuses outside a .claude-profiles root ("not a cpm multi-account machine").
+        # Under a service that variable is unset, so point it at the executor's own
+        # profile directory unless the operator already set it.
+        env = dict(os.environ)
+        env.setdefault(
+            "CLAUDE_CONFIG_DIR",
+            str(Path.home() / ".claude-profiles" / self._config.profile),
+        )
 
         logger.info(
             "spawning worker for task %s: lane=%s goal=%s",
@@ -347,6 +359,7 @@ class AgentExecutor:
             proc = subprocess.Popen(
                 cmd,
                 cwd=self._config.working_dir,
+                env=env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 # On Windows, create a new process group so we can kill the tree
