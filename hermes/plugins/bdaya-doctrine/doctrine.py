@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import hashlib
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 # Plugin root directory
 _PLUGIN_DIR = Path(__file__).resolve().parent
@@ -51,7 +51,7 @@ def load_reference(name: str) -> Optional[str]:
     return _read_text(f"references/{name}")
 
 
-def list_references() -> tuple:
+def list_references() -> Tuple[str, ...]:
     """Return the tuple of reference filenames the router knows about."""
     return _REFERENCES
 
@@ -76,16 +76,19 @@ def compute_checksums() -> Dict[str, str]:
     return result
 
 
-def render_session_injection() -> str:
-    """Render the full doctrine injection for on_session_start.
+def render_session_injection() -> Tuple[str, bool]:
+    """Render the doctrine injection for on_session_start.
 
-    Combines the SOUL.md constitution text with the router table so the
-    session sees both the always-on laws and the deep-load signatures.
+    Returns ``(text, ok)`` — the SOUL.md constitution text (which embeds the
+    router table) and a success flag.  When SOUL.md is missing, returns an
+    error message with ``ok=False`` so the caller can branch without parsing
+    the string.
     """
     soul = load_soul()
     if soul is None:
         return (
             "bdaya-doctrine: SOUL.md not found — doctrine injection unavailable. "
-            "Check plugin installation."
+            "Check plugin installation.",
+            False,
         )
-    return soul
+    return soul, True

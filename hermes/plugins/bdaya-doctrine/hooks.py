@@ -9,9 +9,12 @@ needing to load a skill first.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
-import doctrine
+try:
+    from . import doctrine
+except ImportError:
+    import doctrine
 
 logger = logging.getLogger(__name__)
 
@@ -22,8 +25,8 @@ def doctrine_injection_hook(context: Dict[str, Any]) -> Dict[str, Any]:
     Returns a dict with ``additional_context`` containing the full SOUL.md text.
     Hermes merges this into the system prompt for the session.
     """
-    injection = doctrine.render_session_injection()
-    if not injection.startswith("bdaya-doctrine: SOUL.md not found"):
+    injection, ok = doctrine.render_session_injection()
+    if ok:
         logger.info("bdaya-doctrine: injected constitution (%d chars)", len(injection))
     else:
         logger.warning("bdaya-doctrine: %s", injection)
