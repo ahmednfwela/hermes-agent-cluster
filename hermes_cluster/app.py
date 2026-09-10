@@ -51,6 +51,8 @@ from .routers import visualization as visualization_mod
 from .routers import setup as setup_mod
 from .routers import cluster as cluster_mod
 from .routers import intake as intake_mod
+import logging
+logger = logging.getLogger(__name__)
 
 
 def create_app(
@@ -63,6 +65,7 @@ def create_app(
     node_capabilities: Optional[list] = None,
     agent_executor_config: Optional[dict] = None,
     static_dir: Optional[str] = None,
+    db_path: str = "",
 ) -> FastAPI:
     """Create and configure the FastAPI application.
 
@@ -126,8 +129,22 @@ def create_app(
         allow_headers=["*"],
     )
 
-    # Initialize state
-    state = ClusterState()
+    # Initialize state: SQLite-backed ClusterStore when a db_path is configured
+    # (survives restarts — an in-memory main loses every task on restart), else
+    # the in-memory ClusterState. Both expose the same API.
+    if db_path:
+        from .state.cluster_store import ClusterStore
+        state = ClusterStore(db_path=db_path)
+        logger.info("cluster state: SQLite store at %s", db_path)
+    else:
+        state = ClusterState()
+        logger.info("cluster state: in-memory (set store.db_path in cluster.yaml to persist)")
+
+    @app.on_event("shutdown")
+    def _close_store() -> None:
+        close = getattr(state, "close", None)
+        if callable(close):
+            close()
     state.cluster_id = cluster_id
     state.node_id = node_id
     state.node_role = node_role
