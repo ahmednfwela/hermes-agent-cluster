@@ -430,49 +430,116 @@ class AgentExecutor:
         )
 
     # -------------------------------------------------------------------
-    # Reaping finished spawns
+    # Lane status polling (replaces process.poll — bdaya-dispatch run
+    # backgrounds the lane and exits 0 immediately, so we must track the
+    # LANE, not the spawn process)
     # -------------------------------------------------------------------
 
+    def _poll_lane_status(self, lane_name: str) -> Optional[dict]:
+        """Query bdaya-dispatch status --json and return the lane entry.
+
+        Returns None on command failure or if the lane is not found.
+        """
+        cmd = [
+            "npx", "-y",
+            "-p", self._config.bdaya_dispatch_package,
+            "bdaya-dispatch", "status", "--json",
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                cwd=self._config.working_dir or None,
+            )
+            if result.returncode != 0:
+                logger.warning(
+                    "bdaya-dispatch status failed for lane %s: rc=%d stderr=%s",
+                    lane_name, result.returncode, result.stderr[:200],
+                )
+                return None
+            data = json.loads(result.stdout)
+        except FileNotFoundError:
+            logger.warning("npx not found during lane status poll for %s", lane_name)
+            return None
+        except subprocess.TimeoutExpired:
+            logger.warning("bdaya-dispatch status timed out for lane %s", lane_name)
+            return None
+        except json.JSONDecodeError as e:
+            logger.warning(
+                "bdaya-dispatch status JSON decode error for lane %s: %s",
+                lane_name, e,
+            )
+            return None
+
+        for lane in data.get("lanes", []):
+            if lane.get("name") == lane_name or lane.get("lane") == lane_name:
+                return lane
+        return None
+
+    # Terminal lane states that indicate the lane has finished
+    _TERMINAL_LANE_STATES = frozenset({"done", "blocked", "stopped", "failed", "missing"})
+    # Lane states that indicate success
+    _SUCCESS_LANE_STATES = frozenset({"done"})
+
     def _reap_finished_spawns(self) -> None:
-        """Check if any spawned processes have exited and report results."""
+        """Check lane status for active spawns and report results.
+
+        bdaya-dispatch run backgrounds the lane and exits 0 immediately, so
+        we poll the LANE status (not the process exit code) to determine
+        completion. spawn_timeout remains the outer bound.
+        """
         finished = []
         with self._lock:
-            for task_id, spawn in self._active_spawns.items():
-                rc = spawn.process.poll()
-                if rc is not None:
-                    finished.append((task_id, spawn, rc))
-                elif time.time() - spawn.started_at > self._config.spawn_timeout:
-                    # Timeout — kill the process
-                    logger.warning(
-                        "spawn timeout (%.0fs) for task %s, killing pid %d",
-                        self._config.spawn_timeout,
-                        task_id,
-                        spawn.process.pid,
-                    )
-                    try:
-                        spawn.process.kill()
-                    except OSError:
-                        pass
-                    finished.append((task_id, spawn, -1))
+            active_items = list(self._active_spawns.items())
 
-        for task_id, spawn, rc in finished:
+        for task_id, spawn in active_items:
+            elapsed = time.time() - spawn.started_at
+
+            # Outer timeout bound
+            if elapsed > self._config.spawn_timeout:
+                logger.warning(
+                    "spawn timeout (%.0fs) for task %s (lane=%s)",
+                    self._config.spawn_timeout,
+                    task_id,
+                    spawn.lane_name,
+                )
+                finished.append((task_id, spawn, "timeout", f"exceeded spawn_timeout ({self._config.spawn_timeout:.0f}s)"))
+                continue
+
+            # Poll lane status
+            lane_info = self._poll_lane_status(spawn.lane_name)
+            if lane_info is None:
+                # Could not reach status — keep waiting (transient error)
+                logger.debug(
+                    "lane status unavailable for task %s (lane=%s), will retry",
+                    task_id, spawn.lane_name,
+                )
+                continue
+
+            lane_state = lane_info.get("state", "")
+            if lane_state not in self._TERMINAL_LANE_STATES:
+                # Still working — continue tracking
+                continue
+
+            # Terminal state reached
+            detail = (
+                f"state={lane_state} "
+                f"health={lane_info.get('health', '?')} "
+                f"tools={lane_info.get('toolCount', 0)} "
+                f"idle={lane_info.get('idleSeconds', 0)}s"
+            )
+            finished.append((task_id, spawn, lane_state, detail))
+
+        for task_id, spawn, outcome, detail in finished:
             with self._lock:
                 self._active_spawns.pop(task_id, None)
 
-            if rc == 0:
+            if outcome in self._SUCCESS_LANE_STATES:
                 self._report_completion(task_id)
             else:
-                # Try to capture last lines of output for the failure reason
-                reason = f"worker exited with code {rc}"
-                try:
-                    if spawn.process.stdout:
-                        tail = spawn.process.stdout.read()
-                        if tail:
-                            lines = tail.decode(errors="replace").strip().split("\n")
-                            tail_text = "\n".join(lines[-5:])  # last 5 lines
-                            reason = f"worker exited with code {rc}: {tail_text[:500]}"
-                except Exception:
-                    pass
+                reason = f"lane {outcome}: {detail}"
                 self._report_failure(task_id, reason)
 
     # -------------------------------------------------------------------

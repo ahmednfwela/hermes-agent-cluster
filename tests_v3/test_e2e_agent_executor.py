@@ -21,6 +21,7 @@ from pathlib import Path
 from urllib.request import Request, urlopen
 
 import pytest
+from unittest.mock import MagicMock
 
 # Fix Windows console encoding
 os.environ["PYTHONIOENCODING"] = "utf-8"
@@ -38,9 +39,9 @@ def test_e2e_lifecycle():
     print("=== Agent Executor E2E Test ===")
     print()
 
-    # We'll use FastAPI TestClient for both main and worker
-    # But we need the worker_connector and agent_executor to actually run background threads
-    # So we'll create the apps and manually drive the executor
+    # The executor now tracks LANE status (not process exit codes), because
+    # bdaya-dispatch run backgrounds the lane and exits 0 immediately. So the
+    # e2e mock must fake lane status, not subprocess completion.
 
     # 1. Create main app and its state
     from hermes_cluster.state import ClusterState
@@ -121,15 +122,25 @@ def test_e2e_lifecycle():
         print(f"[OK] Claimed: status={claim_resp.json().get('status')}")
 
     # 5. Now test the agent_executor's claim_and_spawn + reap cycle
-    # We mock subprocess.Popen to use a fast command instead of bdaya-dispatch
-    original_popen = subprocess.Popen
+    # The executor tracks LANE status (not process exit), so we mock
+    # subprocess.Popen (to fake the spawn) and _poll_lane_status (to fake
+    # the lane reaching terminal state).
+    original_popen = ae_module.subprocess.Popen
+
+    spawned_lanes = []
 
     def mock_popen(cmd, **kwargs):
         if any("bdaya-dispatch" in str(c) for c in cmd):
-            return original_popen(
-                [sys.executable, "-c", "import time; time.sleep(1); print('task done')"],
-                **kwargs,
-            )
+            # Record the lane name from --name flag
+            for i, c in enumerate(cmd):
+                if c == "--name" and i + 1 < len(cmd):
+                    spawned_lanes.append(cmd[i + 1])
+                    break
+            mock_proc = MagicMock()
+            mock_proc.poll.return_value = None  # still "running" (backgrounded)
+            mock_proc.pid = 99999
+            mock_proc.stdout = None
+            return mock_proc
         return original_popen(cmd, **kwargs)
 
     ae_module.subprocess.Popen = mock_popen
@@ -166,17 +177,42 @@ def test_e2e_lifecycle():
 
     ae_module._signed_request = mock_signed_request
 
+    # Mock _poll_lane_status: first call returns "working", subsequent return "done"
+    lane_poll_count = [0]
+
+    def mock_poll_lane_status(lane_name):
+        lane_poll_count[0] += 1
+        if lane_poll_count[0] <= 1:
+            return {
+                "name": lane_name,
+                "state": "working",
+                "health": "working",
+                "toolCount": 1,
+                "idleSeconds": 0,
+            }
+        return {
+            "name": lane_name,
+            "state": "done",
+            "health": "done",
+            "toolCount": 5,
+            "idleSeconds": 1,
+        }
+
+    executor._poll_lane_status = mock_poll_lane_status
+
     print()
     print("[..] Running executor poll cycle...")
 
     # 6. Run one poll cycle — should find the task and spawn
     executor._poll_once()
     print(f"[OK] After poll: active_spawns={executor.active_count}")
+    assert executor.active_count == 1, "Expected 1 active spawn after first poll"
 
-    # 7. Wait for the mock spawn to finish (1 second)
-    time.sleep(3)
+    # 7. Run another poll cycle — lane is still "working", should stay active
+    executor._poll_once()
+    assert executor.active_count == 1, "Lane still working, spawn should remain"
 
-    # 8. Run another poll cycle — should reap the finished spawn and report completion
+    # 8. Run another poll cycle — lane now "done", should reap and report completion
     executor._poll_once()
 
     # 9. Check final task state — ASSERT the outcome (B1 fix)
