@@ -227,6 +227,50 @@ class TestHermesReap:
 
         assert resolved and resolved[0][2] == "done"
 
+    def test_resumed_process_reports_exit_for_dead_pid(self):
+        """#851/3 follow-up: on Windows os.kill(<dead pid>, 0) raises OSError
+        errno 22 / WinError 87, not ProcessLookupError. If that is swallowed,
+        poll() returns None forever and a reconciled lane can never complete
+        once "done" requires a clean exit."""
+        from hermes_cluster.core.agent_executor import _ResumedProcess
+
+        proc = _ResumedProcess(pid=999999)
+        err = OSError(22, 'The parameter is incorrect')
+        err.winerror = 87
+
+        with patch('hermes_cluster.core.agent_executor.os.kill', side_effect=err), \
+             patch('hermes_cluster.core.agent_executor.os.name', 'nt'):
+            assert proc.poll() == 0
+        # sticky: no further probing once the process is known gone
+        assert proc.poll() == 0
+
+    def test_resumed_process_still_alive_returns_none(self):
+        from hermes_cluster.core.agent_executor import _ResumedProcess
+
+        proc = _ResumedProcess(pid=4242)
+        with patch('hermes_cluster.core.agent_executor.os.kill', return_value=None):
+            assert proc.poll() is None
+
+    def test_reconciled_spawn_completes_after_pid_gone(self, tmp_path):
+        """End to end: a reconciled spawn whose pid is gone resolves done
+        once its result file has content (the restart-reconcile path)."""
+        from hermes_cluster.core.agent_executor import _ResumedProcess
+
+        executor = _executor(spawn_timeout=3600)
+        result_path = tmp_path / 'reconciled.md'
+        result_path.write_text('the lane answer', encoding='utf-8')
+        spawn = _hermes_spawn('t_reconciled', result_path=str(result_path))
+        spawn.process = _ResumedProcess(pid=999999)
+        err = OSError(22, 'The parameter is incorrect')
+        err.winerror = 87
+
+        resolved = []
+        with patch('hermes_cluster.core.agent_executor.os.kill', side_effect=err), \
+             patch('hermes_cluster.core.agent_executor.os.name', 'nt'):
+            executor._reap_hermes_spawn('t_reconciled', spawn, 42.0, resolved)
+
+        assert resolved and resolved[0][2] == 'done'
+
     def test_timeout_when_still_running(self, tmp_path):
         executor = _executor(worker="hermes", spawn_timeout=10.0)
         result_path = tmp_path / "run.md"
