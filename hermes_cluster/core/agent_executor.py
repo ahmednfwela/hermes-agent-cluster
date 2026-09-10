@@ -266,6 +266,17 @@ class AgentExecutor:
     # Task discovery + spawning
     # -------------------------------------------------------------------
 
+
+    def _is_assigned_to_me(self, assigned_to: str) -> bool:
+        """The main registers nodes as ``node_<id>`` (nodes.py join) while the
+        executor is configured with the bare ``<id>``; accept both spellings so a
+        task the scheduler assigned to this node is actually claimed (live bug:
+        cut-over task stuck ``running`` on every node, #804)."""
+        if not assigned_to:
+            return False
+        mine = {self._node_id, f"node_{self._node_id}"}
+        return assigned_to in mine or assigned_to.removeprefix("node_") == self._node_id
+
     def _claim_and_spawn(self, max_spawns: int) -> None:
         """Poll main for assigned tasks and spawn workers for them."""
         # GET /api/v1/tasks from main node
@@ -292,7 +303,7 @@ class AgentExecutor:
             assigned_to = task.get("assigned_to", "")
             if (
                 status == "running"
-                and assigned_to == self._node_id
+                and self._is_assigned_to_me(assigned_to)
                 and task_id not in active_task_ids
             ):
                 candidates.append(task)
