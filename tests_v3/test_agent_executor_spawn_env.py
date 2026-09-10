@@ -68,3 +68,20 @@ def test_spawn_writes_brief_and_passes_brief_file(monkeypatch, tmp_path):
     text = brief.read_text(encoding="utf-8")
     assert "do a thing" in text and "NEVER approve or merge" in text
     assert cmd[cmd.index("--goal") + 1] == "do a thing"
+
+
+def test_spawn_argv0_is_resolved_windows_cmd_shim(monkeypatch):
+    """Windows CreateProcess ignores PATHEXT: the resolved npx.CMD must be argv[0]."""
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    fake = r"C:\Users\ahmed\.fnm\aliases\default\npx.CMD"
+    monkeypatch.setattr(ae.shutil, "which", lambda name: fake if name == "npx" else None)
+    c = _run_spawn(monkeypatch)
+    assert c["cmd"][0] == fake
+
+
+def test_spawn_argv0_falls_back_to_bare_npx_when_unresolved(monkeypatch):
+    """No resolution -> legacy bare name, FileNotFoundError reporting unchanged."""
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.setattr(ae.shutil, "which", lambda name: None)
+    c = _run_spawn(monkeypatch)
+    assert c["cmd"][0] == "npx"
