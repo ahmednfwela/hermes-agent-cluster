@@ -1,0 +1,12 @@
+name: bdaya-doctrine
+version: 0.1.0
+description: >
+  Bdaya doctrine injection plugin: on_session_start injects the senior-engineer
+  constitution (BCP-14 block, source-of-truth, proof-or-hedge, complexity ladder,
+  standing-rules) and the bdaya-core router table into the session preamble.
+  Bundles reference docs for deep doctrine loads. Stale-doctrine drift detection
+  via content checksums.
+author: "bdaya"
+provides_hooks:
+  - on_session_start
+pip_dependencies: []
