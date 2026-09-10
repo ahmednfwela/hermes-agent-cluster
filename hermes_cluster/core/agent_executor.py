@@ -56,6 +56,16 @@ from typing import Dict, List, Optional
 from urllib.request import Request, urlopen
 from urllib.error import URLError
 
+
+def _npx_bin() -> str:
+    """Resolve the npx launcher for subprocess.Popen without a shell.
+
+    On Windows ``npx`` is ``npx.cmd``; CreateProcess does not apply PATHEXT, so
+    spawning the bare name raises FileNotFoundError ("npx not found") even when
+    Node is on PATH. shutil.which applies PATHEXT and returns the real file.
+    """
+    return shutil.which("npx") or "npx"
+
 logger = logging.getLogger(__name__)
 
 
@@ -489,7 +499,7 @@ class AgentExecutor:
         # Spawn: npx -y -p @shared/bdaya-dispatch bdaya-dispatch run
         #   --name <lane_name> --goal <goal> --model <model>
         cmd = [
-            "npx", "-y",
+            _npx_bin(), "-y",
             "-p", self._config.bdaya_dispatch_package,
             "bdaya-dispatch", "run",
             "--name", lane_name,
@@ -1274,7 +1284,7 @@ class AgentExecutor:
         health alarm after printing valid JSON (F1).
         """
         cmd = [
-            "npx", "-y",
+            _npx_bin(), "-y",
             "-p", self._config.bdaya_dispatch_package,
             "bdaya-dispatch", "status", "--json",
         ]
