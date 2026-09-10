@@ -88,6 +88,24 @@ class TestMergeGateAllows:
         deps = _deps_with_proof(True)
         assert hooks.merge_gate_evaluate(event, deps) is None
 
+    def test_gh_pr_merge_help_is_not_gated(self):
+        """`gh pr merge --help` is documentation lookup, not a merge actuation (F3 fix)."""
+        event = {
+            "tool_name": "Bash",
+            "tool_input": {"command": "gh pr merge --help"},
+        }
+        deps = {"environ": _armed_env()}
+        assert hooks.merge_gate_evaluate(event, deps) is None
+
+    def test_gh_pr_merge_h_short_flag_is_not_gated(self):
+        """`gh pr merge -h` is documentation lookup, not a merge actuation (F3 fix)."""
+        event = {
+            "tool_name": "Bash",
+            "tool_input": {"command": "gh pr merge -h"},
+        }
+        deps = {"environ": _armed_env()}
+        assert hooks.merge_gate_evaluate(event, deps) is None
+
 
 # --- positives: must deny ----------------------------------------------------
 

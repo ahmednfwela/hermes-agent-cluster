@@ -87,8 +87,10 @@ def _looks_like_shell_merge(cmd: str) -> Tuple[Optional[str], Optional[str]]:
     # messages / echo payloads cannot bind a command name.
     stripped = re.sub(r"'[^']*'|\"[^\"]*\"", " ", cmd)
 
-    # External merge: `gh pr merge`
-    if re.search(r"\bgh\s+pr\s+merge\b", stripped):
+    # External merge: `gh pr merge` (but not `gh pr merge --help`)
+    if re.search(r"\bgh\s+pr\s+merge\b", stripped) and not re.search(
+        r"(?:^|\s)(?:--help|-h)(?:\s|$)", stripped
+    ):
         return "external merge", "gh pr merge (GitHub-side merge)"
     # Git push -o merge_request.* auto-merge
     m = re.search(r"\bgit\s+push\b[^|;]*(-o|--push-option)[= ]([^\s;]+)", stripped)
@@ -491,12 +493,17 @@ def dispatch_dedup_evaluate(
 
 PROOF_COVER_RE = re.compile(r"\[(?:PROOF|UNVERIFIED)\]")
 
-# STRONG -- live-system verdict or remediation command.
+# STRONG -- assertive live-system status verdicts.
+# Requires an assertive verb (is/are/was/were/has been/have been) immediately
+# before the verdict word (with an optional single adverb such as "now").
+# "appears X", "seems X", "probably X" do NOT match because they lack the
+# assertive verb — they are handled via the HEDGE_TOKENS sentence exemption.
+# Ported from JS reference: plugins/bdaya-defaults/hooks/lib/consequence-markers.js:89-91
 STRONG_PATTERNS = [
-    re.compile(r"\b(?:deployed|production|prod|live|staging|main branch)\b", re.I),
-    re.compile(r"\b(?:is now|has been|already)\s+(?:fixed|merged|shipped|rolled out|enabled)\b", re.I),
-    re.compile(r"\b(?:pipeline|CI) (?:passed|is green|succeeded)\b", re.I),
-    re.compile(r"\bMR\s+!?\d+\s+(?:merged|approved)\b", re.I),
+    re.compile(
+        r"\b(?:is|are|was|were|has been|have been)\s+(?:now\s+)?(?:working|broken|fixed|healthy|unhealthy|down|up|passing|failing|safe|vulnerable|done|complete|deployed|merged|resolved|idle|active|enabled|disabled)\b",
+        re.I,
+    ),
 ]
 
 # SOFT -- root-cause / code-correctness.
@@ -585,6 +592,41 @@ def _save_state(path: Path, state: ProofOrHedgeState) -> None:
         pass
 
 
+def _last_assistant_text(transcript_text: str) -> str:
+    """Extract the text of the last assistant message from a JSON-lines transcript.
+
+    Mirrors the JS reference: plugins/bdaya-defaults/hooks/proof-or-hedge-stop.js:68-87
+    The transcript is JSON-lines format where each line is a message object.
+    We extract only the last assistant message to avoid the gate tripping on
+    its own denial messages and earlier context (bug #856).
+    """
+    if not transcript_text:
+        return ""
+    last_text = ""
+    for line in transcript_text.split("\n"):
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except (ValueError, json.JSONDecodeError):
+            continue
+        m = msg.get("message") if isinstance(msg, dict) else None
+        if not m or not isinstance(m, dict):
+            continue
+        if m.get("role") != "assistant":
+            continue
+        content = m.get("content")
+        if not isinstance(content, list):
+            continue
+        texts = []
+        for c in content:
+            if isinstance(c, dict) and c.get("type") == "text" and isinstance(c.get("text"), str):
+                texts.append(c["text"])
+        if texts:
+            last_text = "\n".join(texts)
+    return last_text
+
+
 def proof_or_hedge_evaluate(
     input: Dict[str, Any], deps: Optional[Dict[str, Any]] = None
 ) -> Optional[Dict[str, str]]:
@@ -595,20 +637,26 @@ def proof_or_hedge_evaluate(
     already covered by a ``[PROOF]`` / ``[UNVERIFIED]`` marker.
     """
     deps = deps or {}
-    transcript = _safe_str(input.get("transcript") if input else "")
-    if not transcript:
+    transcript_raw = _safe_str(input.get("transcript") if input else "")
+    if not transcript_raw:
         read_transcript = deps.get("read_transcript")
         transcript_path = input.get("transcript_path") if input else None
         if read_transcript and transcript_path:
             try:
-                transcript = read_transcript(transcript_path)
+                transcript_raw = read_transcript(transcript_path)
             except OSError:
-                transcript = ""
+                transcript_raw = ""
         elif transcript_path:
             try:
-                transcript = Path(transcript_path).read_text(encoding="utf-8")
+                transcript_raw = Path(transcript_path).read_text(encoding="utf-8")
             except OSError:
-                transcript = ""
+                transcript_raw = ""
+    if not transcript_raw:
+        return None
+
+    # Extract only the last assistant message to avoid the gate tripping on
+    # its own denial messages and earlier context (bug #856).
+    transcript = _last_assistant_text(transcript_raw)
     if not transcript:
         return None
 
