@@ -21,6 +21,7 @@ def main():
     parser.add_argument("--node-role", default="main", choices=["main", "worker"], help="Node role")
     parser.add_argument("--fed-token", default="", help="Federation auth token")
     parser.add_argument("--cluster-endpoint", default="", help="Main node endpoint (worker only)")
+    parser.add_argument("--db-path", default="", help="SQLite path for a persistent cluster store (default: in-memory)")
     args = parser.parse_args()
 
     # Load config from YAML if provided
@@ -44,6 +45,8 @@ def main():
                 args.host = cfg["server"].get("bind", args.host)
             if "agent_executor" in cfg:
                 args.agent_executor_config = cfg["agent_executor"]
+            if "store" in cfg and not args.db_path:
+                args.db_path = cfg["store"].get("db_path", "") or ""
         except ImportError:
             print("Warning: PyYAML not installed, ignoring config file", file=sys.stderr)
         except Exception as e:
@@ -70,6 +73,7 @@ def main():
         node_capabilities=getattr(args, "node_capabilities", []),
         agent_executor_config=getattr(args, "agent_executor_config", None),
         static_dir=static_dir if static_dir else None,
+        db_path=getattr(args, "db_path", "") or "",
     )
 
     print(f"Starting hermes-cluster (Python) on {args.host}:{args.port}")
