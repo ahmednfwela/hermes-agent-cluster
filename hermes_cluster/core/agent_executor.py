@@ -1,16 +1,29 @@
-"""Agent executor — bridge from cluster task lease to real bdaya worker run.
+"""Agent executor — bridge from cluster task lease to a real worker run.
 
 Polls the main node for tasks assigned (status=running, assigned_to=this node),
-spawns a guarded headless Claude Code worker via bdaya-dispatch for each task,
-and reports completion/failure back to the cluster via signed API calls.
+spawns a guarded headless worker for each task, and reports completion/failure
+back to the cluster via signed API calls.
+
+Two spawn modes (config ``agent_executor.worker``; default ``bdaya-dispatch``):
+  - ``bdaya-dispatch`` — the proven npx bdaya-dispatch lane; completion is
+    detected by polling ``bdaya-dispatch status --json`` (the run backgrounds
+    instantly, so process exit codes are NOT the completion signal).
+  - ``hermes`` — a NATIVE non-interactive hermes session
+    (``hermes -p <profile> chat --query-file <brief> -Q``) that runs the task
+    to completion, writes a result file, and exits non-zero on failure; this
+    mode tracks the process (pid + exit code + result file) instead of lane
+    status.
+
+Restart safety (#804 note 132791): the task→lane map is persisted in the
+ClusterStore SQLite (``task_spawns`` table) and reconciled on start — a lane
+spawned before a crash is resumed from its record, and a task is re-spawned
+only when no record exists (no duplicate worker after an executor restart).
 
 Design:
-  - Reuses the proven bdaya-dispatch spawn mechanism (NOT a new agent runner)
-  - Inherits bdaya-defaults plugin, hooks, mandate gates, typed tooling
-  - One active spawn per lease at a time (configurable max_concurrent)
+  - Worker-mode aware spawn + reap, one active spawn per lease at a time
   - Honours lease TTL — renews while the spawn is running
   - Crashed/hung spawn → /fail with reason, never a silent hang
-  - Config-driven (profile, model), zero hardcoded client specifics
+  - Config-driven (worker, profile, model, hermes_profile, hermes_bin)
   - Uses the same peer-token signing as worker_connector.py
 """
 
@@ -21,6 +34,7 @@ import hmac
 import json
 import logging
 import os
+import shutil
 import subprocess
 import threading
 import time
@@ -43,10 +57,13 @@ class AgentExecutorConfig:
     enabled: bool = False
     profile: str = "alibaba1"
     model: str = "sonnet"
+    worker: str = "bdaya-dispatch"  # "bdaya-dispatch" | "hermes"
     poll_interval: float = 15.0  # seconds between poll cycles
     max_concurrent: int = 1  # max simultaneous spawns
     spawn_timeout: float = 1800.0  # max seconds per spawn (30 min)
     working_dir: str = ""  # working directory for spawned workers
+    hermes_profile: str = "default"  # hermes -p/--profile (hermes worker mode)
+    hermes_bin: str = ""  # path to the hermes CLI; empty → resolve at spawn
     bdaya_dispatch_package: str = "@shared/bdaya-dispatch@latest"
 
 
@@ -56,16 +73,50 @@ class AgentExecutorConfig:
 
 @dataclass
 class ActiveSpawn:
-    """Tracks a running bdaya-dispatch subprocess."""
+    """Tracks a running spawn (bdaya-dispatch subprocess or native hermes)."""
     task_id: str
     task_title: str
     process: subprocess.Popen
     lease_id: str = ""
     started_at: float = 0.0
     lane_name: str = ""
+    mode: str = "bdaya-dispatch"  # which worker mode spawned this (matches config.worker)
+    result_path: str = ""  # hermes mode: path of the result file the lane writes
+    result_file: Optional[object] = None  # open handle for the result file (hermes)
+    resumed: bool = False  # True when reconstructed from the persisted spawn map
     miss_count: int = 0  # consecutive polls where lane was absent from status
     spawn_exit_rc: Optional[int] = None  # set once spawn process exits
     spawn_exit_stderr: str = ""  # captured stderr tail on nonzero exit
+
+
+class _ResumedProcess:
+    """Minimal process stand-in for a spawn reconciled from the persisted map.
+
+    The real subprocess handle is lost when the executor restarts mid-task, so
+    a resumed spawn gets this instead: it answers ``pid`` and ``poll()`` like a
+    Popen (``poll()`` → None while we believe the process may still be alive,
+    or a nonzero rc once we know it cannot be). Completion of a resumed lane is
+    then driven by the lane-status/result-file logic, exactly like a live one.
+    """
+
+    def __init__(self, pid: int):
+        self.pid = pid
+        self._exited = False
+
+    def poll(self) -> Optional[int]:
+        if self._exited:
+            return 0
+        try:
+            os.kill(self.pid, 0)
+            return None
+        except ProcessLookupError:
+            self._exited = True
+            return 0
+        except PermissionError:
+            return None
+        except Exception:
+            # os.kill can raise on invalid pid kinds; treat as unknown → alive
+            return None
 
 
 # ---------------------------------------------------------------------------
@@ -151,17 +202,23 @@ class AgentExecutor:
         node_id: str,
         cluster_endpoint: str,
         peer_token: str = "",
+        store: Optional[object] = None,
     ):
         self._config = config
         self._node_id = node_id
         self._cluster_endpoint = cluster_endpoint.rstrip("/")
         self._token = _resolve_peer_token(peer_token)
+        # Optional ClusterStore/ClusterState for the persisted task->lane map
+        # (#804 note 132791). Without a store the executor is stateless —
+        # restart will re-spawn (superseded once a store is wired).
+        self._store = store
 
         self._active_spawns: Dict[str, ActiveSpawn] = {}  # task_id -> spawn
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._running = False
+        self._reconciled = False
 
         # Resolve working directory
         if not self._config.working_dir:
@@ -177,6 +234,7 @@ class AgentExecutor:
         if self._running:
             logger.warning("agent executor already running")
             return
+        self._reconcile_persisted_spawns()
         self._stop_event.clear()
         self._running = True
         self._thread = threading.Thread(
@@ -222,15 +280,19 @@ class AgentExecutor:
                     "task_title": spawn.task_title[:80],
                     "lane_name": spawn.lane_name,
                     "lease_id": spawn.lease_id,
+                    "mode": spawn.mode,
+                    "resumed": spawn.resumed,
                     "running_seconds": round(time.time() - spawn.started_at, 1),
                     "pid": spawn.process.pid,
                     "poll_alive": spawn.process.poll() is None,
+                    "result_path": spawn.result_path,
                 })
             return {
                 "running": self._running,
                 "node_id": self._node_id,
                 "profile": self._config.profile,
                 "model": self._config.model,
+                "worker": getattr(self._config, "worker", "bdaya-dispatch"),
                 "max_concurrent": self._config.max_concurrent,
                 "active_spawns": len(spawns),
                 "spawns": spawns,
@@ -298,6 +360,7 @@ class AgentExecutor:
         # Filter: status=running, assigned_to=this node, not already spawning
         with self._lock:
             active_task_ids = set(self._active_spawns.keys())
+        active_task_ids |= self._persisted_spawn_task_ids()
 
         candidates = []
         for task in tasks:
@@ -344,6 +407,15 @@ class AgentExecutor:
         return path
 
     def _spawn_worker(self, task: dict) -> None:
+        """Spawn a worker for the given task, dispatching by ``worker`` mode."""
+        # getattr guards the spawn_env unit tests which construct a bare _Cfg
+        # (no worker attr) → default to the legacy bdaya-dispatch mode.
+        if getattr(self._config, "worker", "bdaya-dispatch") == "hermes":
+            self._spawn_hermes_worker(task)
+        else:
+            self._spawn_bdaya_worker(task)
+
+    def _spawn_bdaya_worker(self, task: dict) -> None:
         """Spawn a bdaya-dispatch worker for the given task."""
         task_id = task.get("id", "")
         task_title = task.get("title", "")
@@ -422,15 +494,218 @@ class AgentExecutor:
             lease_id=lease_id,
             started_at=time.time(),
             lane_name=lane_name,
+            mode="bdaya-dispatch",
         )
 
         with self._lock:
             self._active_spawns[task_id] = spawn
+        self._persist_spawn(spawn)
 
         logger.info(
             "spawned worker: task=%s pid=%d lane=%s",
             task_id, proc.pid, lane_name,
         )
+
+    def _resolve_hermes_bin(self) -> str:
+        """Resolve the hermes CLI binary for the hermes worker mode."""
+        if self._config.hermes_bin:
+            return self._config.hermes_bin
+        # Shebang launcher installed by the official install script.
+        candidates = [
+            str(Path.home() / ".local" / "bin" / "hermes"),
+            str(Path.home() / ".hermes" / "hermes-agent" / "venv" / "bin" / "hermes"),
+        ]
+        for candidate in candidates:
+            if os.path.exists(candidate):
+                return candidate
+        return shutil.which("hermes") or "hermes"
+
+    def _hermes_result_path(self, task_id: str) -> Path:
+        """Directory/result file a native hermes lane writes on completion."""
+        d = Path(self._config.working_dir or ".") / "hermes-results"
+        d.mkdir(parents=True, exist_ok=True)
+        return d / f"{task_id}.result.md"
+
+    def _spawn_hermes_worker(self, task: dict) -> None:
+        """Spawn a NATIVE non-interactive hermes session for the given task.
+
+        Invocation (verified against hermes_cli on this node — see brief):
+          hermes -p <profile> chat --query-file <brief> -Q
+        - ``chat --query-file`` (hermes_cli/_parser.py:194-202) reads the single
+          query from a file byte-for-byte (no shell quoting), runs to
+          completion, and exits.
+        - ``-Q/--quiet`` (hermes_cli/_parser.py:225-226) suppresses the banner/
+          spinner/tool previews; only the final response and session info are
+          printed, and cli.py exits 0 on success / non-zero on failure
+          (cli.py:4089-4101).
+        - ``-p <profile>`` (hermes_cli/main.py:508-559) is consumed before
+          parsing and sets HERMES_HOME for the chosen profile.
+
+        Track: pid + exit code + result file (NOT bdaya-dispatch lane status).
+        """
+        task_id = task.get("id", "")
+        task_title = task.get("title", "")
+
+        lane_name = f"hermes-{task_id}"
+        brief_path = self._write_brief(task_id, task_title, task.get("description") or "")
+        result_path = self._hermes_result_path(task_id)
+
+        hermes_bin = self._resolve_hermes_bin()
+        cmd = [
+            hermes_bin,
+            "-p", self._config.hermes_profile,
+            "chat",
+            "--query-file", str(brief_path),
+            "-Q",
+        ]
+
+        logger.info(
+            "spawning native hermes worker for task %s: %s",
+            task_id, " ".join(cmd),
+        )
+
+        # Hold the result file open for the child's lifetime (closing the
+        # parent handle too early breaks stdout inheritance on Windows).
+        result_file = None
+        try:
+            result_file = open(result_path, "w", encoding="utf-8")
+            proc = subprocess.Popen(
+                cmd,
+                cwd=self._config.working_dir,
+                # Agent final response (stdout) lands in the result file;
+                # the session_id line goes to stderr.
+                stdout=result_file,
+                stderr=subprocess.PIPE,
+                # On Windows, create a new process group so we can kill the tree
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
+                if os.name == "nt"
+                else 0,
+            )
+        except FileNotFoundError:
+            if result_file is not None:
+                result_file.close()
+            logger.error(
+                "hermes not found — cannot spawn native worker (looked for %s). "
+                "Ensure hermes is installed or set agent_executor.hermes_bin.",
+                hermes_bin,
+            )
+            self._report_failure(task_id, "executor_error: hermes not found on PATH")
+            return
+        except Exception as e:
+            if result_file is not None:
+                result_file.close()
+            logger.error("failed to spawn native hermes worker for task %s: %s", task_id, e)
+            self._report_failure(task_id, f"executor_error: {e}")
+            return
+
+        lease_id = self._find_lease_for_task(task_id)
+
+        spawn = ActiveSpawn(
+            task_id=task_id,
+            task_title=task_title,
+            process=proc,
+            lease_id=lease_id,
+            started_at=time.time(),
+            lane_name=lane_name,
+            mode="hermes",
+            result_path=str(result_path),
+            result_file=result_file,
+        )
+
+        with self._lock:
+            self._active_spawns[task_id] = spawn
+        self._persist_spawn(spawn)
+
+        logger.info(
+            "spawned native hermes worker: task=%s pid=%d result=%s",
+            task_id, proc.pid, result_path,
+        )
+
+    # -------------------------------------------------------------------
+    # Persisted task->lane map (#804 note 132791)
+    # -------------------------------------------------------------------
+
+    def _persist_spawn(self, spawn: ActiveSpawn) -> None:
+        """Persist a spawn record so a mid-task restart does not re-spawn."""
+        if getattr(self, "_store", None) is None:
+            return
+        try:
+            self._store.record_task_spawn(
+                task_id=spawn.task_id,
+                mode=spawn.mode,
+                job_id=spawn.lane_name,
+                pid=spawn.process.pid,
+                started_at=spawn.started_at,
+                lease_id=spawn.lease_id,
+                lane_name=spawn.lane_name,
+                result_path=spawn.result_path,
+            )
+        except Exception:
+            logger.exception("failed to persist spawn record for task %s", spawn.task_id)
+
+    def _persisted_spawn_task_ids(self) -> set:
+        """Task ids with a persisted spawn record (live spawns must not re-spawn)."""
+        if getattr(self, "_store", None) is None:
+            return set()
+        try:
+            return {r["task_id"] for r in self._store.get_all_task_spawns()}
+        except Exception:
+            logger.exception("failed to read persisted spawn records")
+            return set()
+
+    def _reconcile_persisted_spawns(self) -> None:
+        """Re-load the persisted task->lane map into the in-memory spawn table.
+
+        On restart mid-task, the executor must resume tracking the lanes it
+        already spawned — NOT spawn new ones. Records are rehydrated into
+        ActiveSpawn with a process stand-in; completion is still detected by
+        the mode-specific reap logic (lane status / hermes result file).
+        """
+        if getattr(self, "_store", None) is None:
+            self._reconciled = True
+            return
+        if self._reconciled:
+            return
+        try:
+            records = self._store.get_all_task_spawns()
+        except Exception:
+            logger.exception("failed to reconcile persisted spawn records")
+            self._reconciled = True
+            return
+        reconstituted = 0
+        with self._lock:
+            for record in records:
+                task_id = record.get("task_id", "")
+                if not task_id or task_id in self._active_spawns:
+                    continue
+                spawn = ActiveSpawn(
+                    task_id=task_id,
+                    task_title=record.get("job_id") or task_id,
+                    process=_ResumedProcess(int(record.get("pid") or 0)),
+                    lease_id=record.get("lease_id") or "",
+                    started_at=float(record.get("started_at") or time.time()),
+                    lane_name=record.get("lane_name") or f"hermes-{task_id}",
+                    mode=record.get("mode") or "bdaya-dispatch",
+                    result_path=record.get("result_path") or "",
+                    resumed=True,
+                )
+                self._active_spawns[task_id] = spawn
+                reconstituted += 1
+        self._reconciled = True
+        if reconstituted:
+            logger.info(
+                "reconciled %d persisted spawn(s) from store — resuming tracking, "
+                "NOT re-spawning", reconstituted,
+            )
+
+    def _drop_persisted_spawn(self, task_id: str) -> None:
+        """Remove a terminal spawn's record so a future run may spawn again."""
+        if getattr(self, "_store", None) is None:
+            return
+        try:
+            self._store.delete_task_spawn(task_id)
+        except Exception:
+            logger.exception("failed to drop persisted spawn record for task %s", task_id)
 
     # -------------------------------------------------------------------
     # Reaping finished spawns
@@ -465,7 +740,13 @@ class AgentExecutor:
         if not self._active_spawns:
             return
 
-        lane_states = self._query_all_lane_statuses()
+        # Native hermes lanes are tracked by process exit + result file, not by
+        # bdaya-dispatch lane status — skip the npx status query if every active
+        # spawn is a hermes worker.
+        have_bdaya_lane = any(
+            s.mode != "hermes" for s in self._active_spawns.values()
+        )
+        lane_states = self._query_all_lane_statuses() if have_bdaya_lane else None
 
         # Also check spawn process exit for diagnostic info (F7)
         self._capture_spawn_exits()
@@ -474,6 +755,11 @@ class AgentExecutor:
         with self._lock:
             for task_id, spawn in list(self._active_spawns.items()):
                 elapsed = time.time() - spawn.started_at
+
+                # Hermes workers: reap by pid + exit code + result file.
+                if spawn.mode == "hermes":
+                    self._reap_hermes_spawn(task_id, spawn, elapsed, resolved)
+                    continue
 
                 # 1. Check lane state FIRST (before timeout) — F3
                 if lane_states is not None:
@@ -546,11 +832,89 @@ class AgentExecutor:
         for task_id, spawn, outcome, detail in resolved:
             with self._lock:
                 self._active_spawns.pop(task_id, None)
+            # A terminal lane's persisted record is dropped so a future run of
+            # the same task may spawn again; an active lane's record survives
+            # restarts and blocks a duplicate spawn.
+            self._drop_persisted_spawn(task_id)
 
             if outcome == "done":
                 self._report_completion(task_id, detail=detail)
             else:
                 self._report_failure(task_id, f"lane {spawn.lane_name}: {detail}")
+
+    def _reap_hermes_spawn(
+        self,
+        task_id: str,
+        spawn: ActiveSpawn,
+        elapsed: float,
+        resolved: List,
+    ) -> None:
+        """Reap a native hermes spawn by its process exit + result file.
+
+        Completion contract (hermes ``chat --query-file ... -Q``):
+          - RC 0 and a non-empty result file → done
+          - RC 0 without a result file → fail (agent produced nothing)
+          - RC != 0 → fail with captured stderr tail
+          - still running → keep waiting (bounded by spawn_timeout)
+        A resumed spawn (executor restarted mid-task) drives completion off the
+        result file: if it exists and is non-empty the lane finished writing
+        even though the original process handle is gone.
+        """
+        rc = spawn.process.poll()
+
+        # A resolved hermes spawn releases its result-file handle (the child
+        # has exited by then, so the close only releases the parent's copy).
+        if rc is not None and spawn.result_file is not None:
+            try:
+                spawn.result_file.flush()
+                spawn.result_file.close()
+            except Exception:
+                pass
+            finally:
+                spawn.result_file = None
+
+        # Result file is the primary completion signal for hermes: the agent
+        # writes its final response there, then exits 0.
+        result_ok = bool(spawn.result_path) and Path(spawn.result_path).is_file()
+        if result_ok:
+            try:
+                contents = Path(spawn.result_path).read_text(
+                    encoding="utf-8", errors="replace"
+                )
+            except OSError:
+                contents = ""
+            if contents.strip():
+                resolved.append((
+                    task_id, spawn, "done",
+                    f"hermes result written in {elapsed:.0f}s ({spawn.result_path})",
+                ))
+                return
+
+        if rc is not None and rc != 0:
+            detail = f"hermes exited rc={rc} after {elapsed:.0f}s"
+            if spawn.spawn_exit_stderr:
+                detail += f": {spawn.spawn_exit_stderr[:300]}"
+            resolved.append((task_id, spawn, "spawn_failed", detail))
+            return
+
+        if rc is not None and rc == 0:
+            # Exited cleanly but produced no result file/content.
+            resolved.append((
+                task_id, spawn, "no_result",
+                f"hermes exited rc=0 after {elapsed:.0f}s but wrote no result",
+            ))
+            return
+
+        # Timeout is the outer bound for a still-running lane.
+        if rc is None and elapsed > self._config.spawn_timeout:
+            logger.warning(
+                "hermes spawn timeout (%.0fs) for task %s",
+                self._config.spawn_timeout, task_id,
+            )
+            resolved.append((
+                task_id, spawn, "timeout",
+                f"exceeded {self._config.spawn_timeout:.0f}s",
+            ))
 
     def _capture_spawn_exits(self) -> None:
         """Check if any spawn processes have exited and capture diagnostics."""

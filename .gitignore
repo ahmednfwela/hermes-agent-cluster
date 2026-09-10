@@ -1,3 +1,5 @@
 hermes_cluster.egg-info/
 .venv/
 __pycache__/
+hermes-briefs/
+hermes-results/

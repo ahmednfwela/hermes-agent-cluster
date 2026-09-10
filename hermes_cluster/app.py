@@ -206,16 +206,22 @@ def create_app(
                 enabled=True,
                 profile=ae_cfg_dict.get("profile", "alibaba1"),
                 model=ae_cfg_dict.get("model", "qwen3.7-plus"),
+                worker=ae_cfg_dict.get("worker", "bdaya-dispatch"),
                 poll_interval=float(ae_cfg_dict.get("poll_interval", 15)),
                 max_concurrent=int(ae_cfg_dict.get("max_concurrent", 1)),
                 spawn_timeout=float(ae_cfg_dict.get("spawn_timeout", 1800)),
                 working_dir=ae_cfg_dict.get("working_dir", ""),
+                hermes_profile=ae_cfg_dict.get("hermes_profile", "default"),
+                hermes_bin=ae_cfg_dict.get("hermes_bin", ""),
             )
             _agent_executor = AgentExecutor(
                 config=ae_cfg,
                 node_id=state.node_id,
                 cluster_endpoint=cluster_endpoint,
                 peer_token=fed_token,
+                # Persisted task->lane map: a mid-task restart reconciles from
+                # the same store instead of re-spawning (#804 note 132791).
+                store=state,
             )
             _agent_executor.start()
 

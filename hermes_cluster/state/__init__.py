@@ -94,6 +94,10 @@ class ClusterState:
         self._config: Optional[Dict[str, Any]] = None
         self._config_path: str = ""
 
+        # Agent executor spawn tracking (task -> lane map)
+        self._task_spawns_lock = threading.Lock()
+        self._task_spawns: Dict[str, dict] = {}
+
         # Server info
         self.started_at: datetime = datetime.utcnow()
         self.cluster_id: str = "cluster_default"
@@ -675,6 +679,47 @@ class ClusterState:
             self._deliveries.append(delivery)
             if len(self._deliveries) > self._max_deliveries:
                 self._deliveries = self._deliveries[-self._max_deliveries:]
+
+    # -----------------------------------------------------------------------
+    # Agent executor spawn tracking (task -> lane map)
+    # -----------------------------------------------------------------------
+
+    def record_task_spawn(
+        self,
+        task_id: str,
+        mode: str = "bdaya-dispatch",
+        job_id: str = "",
+        pid: int = 0,
+        started_at: float = 0.0,
+        lease_id: str = "",
+        lane_name: str = "",
+        result_path: str = "",
+    ) -> None:
+        """Persist a task spawn record (in-memory mirror of ClusterStore)."""
+        with self._task_spawns_lock:
+            self._task_spawns[task_id] = {
+                "task_id": task_id,
+                "mode": mode,
+                "job_id": job_id,
+                "pid": pid,
+                "started_at": started_at,
+                "lease_id": lease_id,
+                "lane_name": lane_name,
+                "result_path": result_path,
+            }
+
+    def get_task_spawn(self, task_id: str) -> Optional[dict]:
+        with self._task_spawns_lock:
+            record = self._task_spawns.get(task_id)
+            return dict(record) if record else None
+
+    def get_all_task_spawns(self) -> List[dict]:
+        with self._task_spawns_lock:
+            return [dict(r) for r in self._task_spawns.values()]
+
+    def delete_task_spawn(self, task_id: str) -> bool:
+        with self._task_spawns_lock:
+            return self._task_spawns.pop(task_id, None) is not None
 
     # -----------------------------------------------------------------------
     # Config

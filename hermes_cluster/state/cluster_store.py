@@ -183,6 +183,20 @@ CREATE TABLE IF NOT EXISTS kv_store (
     value TEXT
 );
 
+-- Agent executor spawn tracking (task -> lane map, persisted across restarts).
+-- Reconciles on executor start so a mid-task restart does not re-spawn a lane
+-- already tracking the task (#804 note 132791).
+CREATE TABLE IF NOT EXISTS task_spawns (
+    task_id TEXT PRIMARY KEY,
+    mode TEXT NOT NULL DEFAULT 'bdaya-dispatch',
+    job_id TEXT DEFAULT '',
+    pid INTEGER DEFAULT 0,
+    started_at REAL NOT NULL,
+    lease_id TEXT DEFAULT '',
+    lane_name TEXT DEFAULT '',
+    result_path TEXT DEFAULT ''
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_priority ON tasks(priority);
 CREATE INDEX IF NOT EXISTS idx_tasks_assigned ON tasks(assigned_to);
@@ -191,6 +205,7 @@ CREATE INDEX IF NOT EXISTS idx_leases_status ON leases(status);
 CREATE INDEX IF NOT EXISTS idx_leases_expires ON leases(expires_at);
 CREATE INDEX IF NOT EXISTS idx_deliveries_hook ON deliveries(hook_id);
 CREATE INDEX IF NOT EXISTS idx_recovery_node ON recovery_events(node_id);
+CREATE INDEX IF NOT EXISTS idx_task_spawns_started ON task_spawns(started_at);
 """
 
 
@@ -1084,6 +1099,49 @@ class ClusterStore:
             status=row["status"],
             created_at=_str_to_dt(row["created_at"]),
         )
+
+    # -------------------------------------------------------------------
+    # Agent executor spawn tracking (task -> lane map)
+    # -------------------------------------------------------------------
+
+    def record_task_spawn(
+        self,
+        task_id: str,
+        mode: str = "bdaya-dispatch",
+        job_id: str = "",
+        pid: int = 0,
+        started_at: float = 0.0,
+        lease_id: str = "",
+        lane_name: str = "",
+        result_path: str = "",
+    ) -> None:
+        """Persist a task spawn record (upsert by task_id)."""
+        with self._tx() as conn:
+            conn.execute(
+                """INSERT OR REPLACE INTO task_spawns
+                   (task_id, mode, job_id, pid, started_at, lease_id, lane_name, result_path)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (task_id, mode, job_id, pid, started_at, lease_id, lane_name, result_path),
+            )
+
+    def get_task_spawn(self, task_id: str) -> Optional[dict]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM task_spawns WHERE task_id = ?", (task_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_all_task_spawns(self) -> List[dict]:
+        with self._lock:
+            rows = self._conn.execute("SELECT * FROM task_spawns").fetchall()
+        return [dict(r) for r in rows]
+
+    def delete_task_spawn(self, task_id: str) -> bool:
+        with self._tx() as conn:
+            result = conn.execute(
+                "DELETE FROM task_spawns WHERE task_id = ?", (task_id,)
+            )
+            return result.rowcount > 0
 
     # -------------------------------------------------------------------
     # Config
