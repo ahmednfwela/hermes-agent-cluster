@@ -240,6 +240,7 @@ class ClusterCore:
         capabilities: Optional[List[str]] = None,
         db_path: str = ":memory:",
         config_path: str = "",
+        max_concurrent: int = 0,
         # Watchdog timing
         watchdog_check_interval: float = 5.0,
         watchdog_degraded_after: float = 15.0,
@@ -253,6 +254,7 @@ class ClusterCore:
         self.node_name = node_name
         self.node_role = node_role
         self.capabilities = capabilities or ["planning", "reviewing", "scheduling"]
+        self.max_concurrent = max(0, int(max_concurrent))
         self.config_path = config_path
         self.started_at = datetime.utcnow()
 
@@ -399,6 +401,7 @@ class ClusterCore:
                 name=self.node_name,
                 capabilities=self.capabilities,
                 status=NodeStatus.online,
+                max_concurrent=self.max_concurrent,
             )
         )
         logger.info("registered node: %s capabilities=%s", self.node_id, self.capabilities)

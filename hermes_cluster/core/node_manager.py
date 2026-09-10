@@ -156,6 +156,7 @@ class NodeManager:
         name: str = "",
         capabilities: Optional[List[str]] = None,
         load: float = 0.0,
+        max_concurrent: int = 0,
     ) -> Node:
         """Register a new node in the cluster.
 
@@ -167,6 +168,9 @@ class NodeManager:
             name: human-readable name (defaults to node_id)
             capabilities: list of capability strings
             load: initial load value (0.0 - 1.0)
+            max_concurrent: maximum simultaneously-assigned tasks the node
+                can run; 0 = unlimited. The scheduler honours this ceiling
+                so an overloaded worker receives no new assignments (#833).
 
         Returns:
             The registered Node object.
@@ -179,10 +183,12 @@ class NodeManager:
 
         existing = self._store.get_node(node_id)
         if existing is not None:
-            # Re-join: update status + heartbeat + capabilities
+            # Re-join: update status + heartbeat + capabilities + capacity
             self._store.update_heartbeat(node_id)
             if caps:
                 self._store.update_capabilities(node_id, caps)
+            if max_concurrent:
+                self._store.update_max_concurrent(node_id, max_concurrent)
             node = self._store.get_node(node_id)
             logger.info("node re-joined: %s", node_id)
             self._emit(NodeEvent(node_id, "joined", f"re-join, caps={caps}"))
@@ -195,11 +201,15 @@ class NodeManager:
             status=NodeStatus.online,
             last_heartbeat=now,
             load=load,
+            max_concurrent=max(0, int(max_concurrent)),
         )
         self._store.register_node(node)
         self._cap_cache[node_id] = list(caps)
 
-        logger.info("node joined: %s (name=%s, caps=%s)", node_id, name, caps)
+        logger.info(
+            "node joined: %s (name=%s, caps=%s, max_concurrent=%d)",
+            node_id, name, caps, max_concurrent,
+        )
         self._emit(NodeEvent(node_id, "joined", f"name={name}, caps={caps}"))
         return node
 

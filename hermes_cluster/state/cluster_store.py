@@ -37,6 +37,11 @@ from ..models import (
     Task,
     TaskStatus,
 )
+from ..core.scheduler import (
+    ACTIVE_TASK_STATUSES,
+    TERMINAL_TASK_STATUSES,
+    FairScheduler,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -93,7 +98,8 @@ CREATE TABLE IF NOT EXISTS nodes (
     capabilities TEXT DEFAULT '[]',
     status TEXT DEFAULT 'online',
     last_heartbeat TEXT,
-    load REAL DEFAULT 0.0
+    load REAL DEFAULT 0.0,
+    max_concurrent INTEGER DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS tasks (
@@ -236,6 +242,9 @@ class ClusterStore:
         self._max_decisions: int = 200
         self._max_deliveries: int = 1000
 
+        # Fair scheduler (least-loaded node, round-robin ties, capacity-aware)
+        self._fair_scheduler = FairScheduler()
+
         self._init_db()
 
     def _init_db(self) -> None:
@@ -251,7 +260,25 @@ class ClusterStore:
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.executescript(_SCHEMA_SQL)
+        self._migrate_schema()
         self._conn.commit()
+
+    def _migrate_schema(self) -> None:
+        """Migrate pre-existing databases forward.
+
+        ``CREATE TABLE IF NOT EXISTS`` never adds columns to a table that
+        already exists, so databases created before ``nodes.max_concurrent``
+        (scheduler fairness, #833) need ``ALTER TABLE`` to pick up the
+        column, or the fair scheduler cannot honour per-node ceilings.
+        """
+        cols = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(nodes)").fetchall()
+        }
+        if "max_concurrent" not in cols:
+            self._conn.execute(
+                "ALTER TABLE nodes ADD COLUMN max_concurrent INTEGER DEFAULT 0"
+            )
 
     @contextmanager
     def _tx(self):
@@ -278,10 +305,12 @@ class ClusterStore:
         now = datetime.utcnow()
         with self._tx() as conn:
             conn.execute(
-                """INSERT OR REPLACE INTO nodes (id, name, capabilities, status, last_heartbeat, load)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
+                """INSERT OR REPLACE INTO nodes
+                   (id, name, capabilities, status, last_heartbeat, load, max_concurrent)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 (node.id, node.name, _json_dumps(node.capabilities),
-                 node.status.value, _dt_to_str(node.last_heartbeat), node.load),
+                 node.status.value, _dt_to_str(node.last_heartbeat), node.load,
+                 node.max_concurrent),
             )
         if self._on_node_online:
             try:
@@ -328,6 +357,15 @@ class ClusterStore:
             except Exception:
                 pass
 
+    def update_max_concurrent(self, node_id: str, max_concurrent: int) -> None:
+        """Update a node's concurrency ceiling (re-join may re-declare it)."""
+        value = max(0, int(max_concurrent))
+        with self._tx() as conn:
+            conn.execute(
+                "UPDATE nodes SET max_concurrent = ? WHERE id = ?",
+                (value, node_id),
+            )
+
     def node_count(self) -> int:
         with self._lock:
             row = self._conn.execute("SELECT COUNT(*) as c FROM nodes").fetchone()
@@ -367,6 +405,7 @@ class ClusterStore:
             status=NodeStatus(row["status"]),
             last_heartbeat=_str_to_dt(row["last_heartbeat"]),
             load=row["load"],
+            max_concurrent=row["max_concurrent"] if "max_concurrent" in row.keys() else 0,
         )
 
     # -------------------------------------------------------------------
@@ -436,14 +475,31 @@ class ClusterStore:
             return result.rowcount > 0
 
     def unassign_task(self, task_id: str) -> bool:
-        """Atomically clear assigned_to and set status to ready."""
+        """Atomically clear assigned_to and set status to ready.
+
+        Guarded to match ``ClusterState.unassign_task``:
+          - a terminal task is never revived;
+          - a task whose lease is still active is never unassigned — the
+            lease is exclusive ownership and only recovery/expiry may move
+            the task again (#833).
+        """
         now = datetime.utcnow()
+        terminal_ids = [s.value for s in TERMINAL_TASK_STATUSES]
+        placeholders = ",".join("?" for _ in terminal_ids)
         with self._tx() as conn:
             result = conn.execute(
-                """UPDATE tasks SET assigned_to = NULL, status = ?,
-                   updated_at = ?, version = version + 1
-                   WHERE id = ?""",
-                (TaskStatus.ready.value, _dt_to_str(now), task_id),
+                f"""UPDATE tasks SET assigned_to = NULL, status = ?,
+                    updated_at = ?, version = version + 1
+                    WHERE id = ?
+                      AND status NOT IN ({placeholders})
+                      AND NOT EXISTS (
+                          SELECT 1 FROM leases
+                          WHERE leases.task_id = tasks.id
+                            AND leases.status = ?
+                            AND leases.expires_at > ?
+                      )""",
+                (TaskStatus.ready.value, _dt_to_str(now), task_id,
+                 *terminal_ids, LeaseStatus.active.value, _dt_to_str(now)),
             )
             return result.rowcount > 0
 
@@ -860,18 +916,58 @@ class ClusterStore:
         return promoted
 
     def schedule_pending(self) -> int:
-        """Try to assign ready tasks to available nodes."""
-        scheduled = 0
+        """Assign ready tasks to capable online nodes. Returns count scheduled.
+
+        Fairness fix (#833): routes through the shared planner so the node
+        with the fewest active tasks wins and ties rotate round-robin —
+        previously the first capability-matching node took everything.
+        """
+        return len(self.schedule_pending_detailed())
+
+    def schedule_pending_detailed(self) -> List[Dict[str, Any]]:
+        """Assign ready tasks to the least-loaded capable online node.
+
+        Returns the NEW assignments made by this call (one dict per task:
+        ``task_id``/``task_title``/``node_id``/``priority``) so the trigger
+        endpoint reports only new work, not every running task.
+
+        Rules mirror the in-memory ``ClusterState.schedule_pending_detailed``
+        (see ``hermes_cluster/core/scheduler.py``): online nodes only, least
+        active tasks first with round-robin ties, ``max_concurrent`` never
+        exceeded, active leases never re-assigned.
+        """
+        new_assignments: List[Dict[str, Any]] = []
+        now = datetime.utcnow()
         with self._tx() as conn:
-            online_nodes = [
-                self._row_to_node(r)
+            node_rows = conn.execute(
+                "SELECT * FROM nodes WHERE status = ?",
+                (NodeStatus.online.value,),
+            ).fetchall()
+            if not node_rows:
+                return new_assignments
+            online_nodes = [self._row_to_node(r) for r in node_rows]
+
+            # Per-node active load from tasks currently assigned to each node.
+            active_counts: Dict[str, int] = {}
+            active_statuses = [s.value for s in ACTIVE_TASK_STATUSES]
+            active_ph = ",".join("?" for _ in active_statuses)
+            for row in conn.execute(
+                f"""SELECT assigned_to, COUNT(*) AS c FROM tasks
+                    WHERE status IN ({active_ph}) AND assigned_to IS NOT NULL
+                    GROUP BY assigned_to""",
+                active_statuses,
+            ).fetchall():
+                if row["assigned_to"]:
+                    active_counts[row["assigned_to"]] = row["c"]
+
+            # Tasks that still hold an active lease must not be re-assigned.
+            leased = {
+                r["task_id"]
                 for r in conn.execute(
-                    "SELECT * FROM nodes WHERE status = ?",
-                    (NodeStatus.online.value,),
+                    "SELECT task_id FROM leases WHERE status = ? AND expires_at > ?",
+                    (LeaseStatus.active.value, _dt_to_str(now)),
                 ).fetchall()
-            ]
-            if not online_nodes:
-                return 0
+            }
 
             ready_tasks = [
                 self._row_to_task(r)
@@ -880,50 +976,62 @@ class ClusterStore:
                        ORDER BY priority, created_at""",
                     (TaskStatus.ready.value,),
                 ).fetchall()
+                if r["id"] not in leased
             ]
 
             for task in ready_tasks:
-                for node in online_nodes:
-                    if not task.requires or all(
-                        cap in node.capabilities for cap in task.requires
-                    ):
-                        conn.execute(
-                            """UPDATE tasks SET status = ?, assigned_to = ?,
-                               updated_at = ?, version = version + 1
-                               WHERE id = ?""",
-                            (TaskStatus.running.value, node.id,
-                             _dt_to_str(datetime.utcnow()), task.id),
-                        )
-                        decision = SchedulingDecision(
-                            task_id=task.id,
-                            task_title=task.title,
-                            priority=task.priority,
-                            node_id=node.id,
-                            score=1.0,
-                            reason="capability_match",
-                        )
-                        # Inline record_decision to avoid nested _tx()
-                        conn.execute(
-                            """INSERT INTO scheduling_decisions
-                               (task_id, task_title, priority, node_id, score, reason, timestamp)
-                               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                            (decision.task_id, decision.task_title, decision.priority,
-                             decision.node_id, decision.score, decision.reason,
-                             _dt_to_str(decision.timestamp)),
-                        )
-                        # Trim old decisions within same transaction
-                        count = conn.execute(
-                            "SELECT COUNT(*) as c FROM scheduling_decisions"
-                        ).fetchone()["c"]
-                        if count > self._max_decisions:
-                            conn.execute(
-                                """DELETE FROM scheduling_decisions WHERE id NOT IN
-                                   (SELECT id FROM scheduling_decisions ORDER BY id DESC LIMIT ?)""",
-                                (self._max_decisions,),
-                            )
-                        scheduled += 1
-                        break
-        return scheduled
+                node = self._fair_scheduler.choose(
+                    task.requires, online_nodes, active_counts
+                )
+                if node is None:
+                    # No candidate with spare capacity: leave ready for a later trigger.
+                    continue
+
+                conn.execute(
+                    """UPDATE tasks SET status = ?, assigned_to = ?,
+                       updated_at = ?, version = version + 1
+                       WHERE id = ?""",
+                    (TaskStatus.running.value, node.id, _dt_to_str(now), task.id),
+                )
+                active_counts[node.id] = active_counts.get(node.id, 0) + 1
+                self._fair_scheduler.mark_picked(node.id)
+
+                decision = SchedulingDecision(
+                    task_id=task.id,
+                    task_title=task.title,
+                    priority=task.priority,
+                    node_id=node.id,
+                    score=1.0,
+                    reason="least_loaded_capability_match",
+                )
+                # Inline record_decision to avoid nested _tx()
+                conn.execute(
+                    """INSERT INTO scheduling_decisions
+                       (task_id, task_title, priority, node_id, score, reason, timestamp)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (decision.task_id, decision.task_title, decision.priority,
+                     decision.node_id, decision.score, decision.reason,
+                     _dt_to_str(decision.timestamp)),
+                )
+                # Trim old decisions within same transaction
+                count = conn.execute(
+                    "SELECT COUNT(*) as c FROM scheduling_decisions"
+                ).fetchone()["c"]
+                if count > self._max_decisions:
+                    conn.execute(
+                        """DELETE FROM scheduling_decisions WHERE id NOT IN
+                           (SELECT id FROM scheduling_decisions ORDER BY id DESC LIMIT ?)""",
+                        (self._max_decisions,),
+                    )
+
+                new_assignments.append({
+                    "task_id": task.id,
+                    "task_title": task.title,
+                    "node_id": node.id,
+                    "priority": task.priority,
+                })
+
+        return new_assignments
 
     def _row_to_decision(self, row: sqlite3.Row) -> SchedulingDecision:
         return SchedulingDecision(
