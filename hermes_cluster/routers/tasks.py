@@ -34,7 +34,14 @@ def _generate_task_id() -> str:
 async def submit_task(req: SubmitTaskRequest):
     task_id = _generate_task_id()
     priority = req.priority if req.priority > 0 else 3
-    task = _state.create_task(task_id, req.title, req.requires, priority)
+    task = _state.create_task(
+        task_id,
+        req.title,
+        req.requires,
+        priority,
+        lane_key=req.lane_key,
+        role=req.role,
+    )
     # Promote pending → ready (tasks with no deps go to ready immediately)
     # But do NOT auto-assign to nodes — use /schedule/trigger for that
     _state.trigger_pending_tasks()

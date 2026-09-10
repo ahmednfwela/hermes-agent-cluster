@@ -124,6 +124,8 @@ class Task(BaseModel):
     updated_at: datetime = Field(default_factory=datetime.utcnow)
     version: int = 0
     fail_reason: Optional[str] = None
+    lane_key: str = ""  # stateful lane identity; empty = per-task session
+    role: str = "author"  # "author" (profile default model) | "reviewer" (opus tier)
 
     model_config = {"populate_by_name": True}
 
@@ -689,6 +691,8 @@ class SubmitTaskRequest(BaseModel):
     title: str
     requires: List[str] = []
     priority: int = 0  # 1=highest, 5=lowest, default 3
+    lane_key: str = ""  # stateful lane identity (e.g. "shared/claude-plugins#feat/x")
+    role: str = "author"  # "author" | "reviewer"
 
 
 class FailTaskRequest(BaseModel):
