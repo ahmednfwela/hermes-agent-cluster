@@ -320,39 +320,24 @@ class AgentExecutor:
         d = Path(self._config.working_dir or ".") / "hermes-briefs"
         d.mkdir(parents=True, exist_ok=True)
         path = d / f"{task_id}.md"
-        body = (
-            f"## Hermes cluster task {task_id}
-
-"
-            f"**Title:** {title}
-
-"
-            f"{description.strip()}
-
-" if description.strip() else ""
-        )
-        body = (
-            f"## Hermes cluster task {task_id}
-
-**Title:** {title}
-
-"
-            + (f"{description.strip()}
-
-" if description.strip() else "")
-            + "### Standing lane rules
-"
+        lines = [
+            f"## Hermes cluster task {task_id}",
+            "",
+            f"**Title:** {title}",
+            "",
+        ]
+        if description.strip():
+            lines += [description.strip(), ""]
+        lines += [
+            "### Standing lane rules",
             "- You are a headless worker spawned by the Hermes cluster executor on node "
-            f"`{self._node_id}`; report blockers in your RETURN VALUE, never AskUserQuestion.
-"
-            "- NEVER approve or merge your own work; open MRs as Draft and hand off for independent review.
-"
-            "- Cheap models only; never print a secret value.
-"
-            "- When done, state exactly what you produced (files, MR links, proof) in your final message.
-"
-        )
-        path.write_text(body, encoding="utf-8")
+            f"`{self._node_id}`; report blockers in your RETURN VALUE, never AskUserQuestion.",
+            "- NEVER approve or merge your own work; open MRs as Draft and hand off for independent review.",
+            "- Cheap models only; never print a secret value.",
+            "- When done, state exactly what you produced (files, MR links, proof) in your final message.",
+            "",
+        ]
+        path.write_text(chr(10).join(lines), encoding="utf-8")
         return path
 
     def _spawn_worker(self, task: dict) -> None:
