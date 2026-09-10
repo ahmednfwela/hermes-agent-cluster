@@ -55,3 +55,16 @@ def test_spawn_keeps_operator_claude_config_dir(monkeypatch):
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", r"C:\custom\.claude-profiles\lead")
     c = _run_spawn(monkeypatch)
     assert c["kw"]["env"]["CLAUDE_CONFIG_DIR"] == r"C:\custom\.claude-profiles\lead"
+
+
+def test_spawn_writes_brief_and_passes_brief_file(monkeypatch, tmp_path):
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.setattr(_Cfg, "working_dir", str(tmp_path))
+    c = _run_spawn(monkeypatch)
+    cmd = c["cmd"]
+    assert "--brief-file" in cmd
+    brief = Path(cmd[cmd.index("--brief-file") + 1])
+    assert brief.exists() and brief.parent == tmp_path / "hermes-briefs"
+    text = brief.read_text(encoding="utf-8")
+    assert "do a thing" in text and "NEVER approve or merge" in text
+    assert cmd[cmd.index("--goal") + 1] == "do a thing"
