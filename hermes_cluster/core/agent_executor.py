@@ -315,6 +315,46 @@ class AgentExecutor:
         for task in candidates[:max_spawns]:
             self._spawn_worker(task)
 
+    def _write_brief(self, task_id: str, title: str, description: str) -> Path:
+        """Write the per-task brief file the guarded worker lane reads."""
+        d = Path(self._config.working_dir or ".") / "hermes-briefs"
+        d.mkdir(parents=True, exist_ok=True)
+        path = d / f"{task_id}.md"
+        body = (
+            f"## Hermes cluster task {task_id}
+
+"
+            f"**Title:** {title}
+
+"
+            f"{description.strip()}
+
+" if description.strip() else ""
+        )
+        body = (
+            f"## Hermes cluster task {task_id}
+
+**Title:** {title}
+
+"
+            + (f"{description.strip()}
+
+" if description.strip() else "")
+            + "### Standing lane rules
+"
+            "- You are a headless worker spawned by the Hermes cluster executor on node "
+            f"`{self._node_id}`; report blockers in your RETURN VALUE, never AskUserQuestion.
+"
+            "- NEVER approve or merge your own work; open MRs as Draft and hand off for independent review.
+"
+            "- Cheap models only; never print a secret value.
+"
+            "- When done, state exactly what you produced (files, MR links, proof) in your final message.
+"
+        )
+        path.write_text(body, encoding="utf-8")
+        return path
+
     def _spawn_worker(self, task: dict) -> None:
         """Spawn a bdaya-dispatch worker for the given task."""
         task_id = task.get("id", "")
@@ -323,8 +363,12 @@ class AgentExecutor:
         # Build the lane name (must be unique and traceable)
         lane_name = f"hermes-{task_id}"
 
-        # Build the goal prompt
-        goal = task_title
+        # bdaya-dispatch's `run` contract requires --goal (one line) TOGETHER with
+        # --brief-file (an already-written file the lane reads); a bare --goal is
+        # refused. The goal is the task title (one line); the brief carries the
+        # full task text plus the standing lane rules.
+        goal = " ".join(task_title.split())[:300] or task_id
+        brief_path = self._write_brief(task_id, task_title, task.get("description") or "")
 
         # Spawn: npx -y -p @shared/bdaya-dispatch bdaya-dispatch run
         #   --name <lane_name> --goal <goal> --model <model>
@@ -334,6 +378,7 @@ class AgentExecutor:
             "bdaya-dispatch", "run",
             "--name", lane_name,
             "--goal", goal,
+            "--brief-file", str(brief_path),
             "--model", self._config.model,
             "--profile", self._config.profile,
             "--require-goal",
