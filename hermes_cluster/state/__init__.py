@@ -32,6 +32,11 @@ from ..models import (
     EventType,
     FederationClusterStatus,
 )
+from ..core.scheduler import (
+    ACTIVE_TASK_STATUSES,
+    TERMINAL_TASK_STATUSES,
+    FairScheduler,
+)
 
 
 def _generate_id(prefix: str = "") -> str:
@@ -78,6 +83,9 @@ class ClusterState:
         self._schedule_lock = threading.Lock()
         self._decisions: List[SchedulingDecision] = []
         self._max_decisions: int = 200
+
+        # Fair scheduler (least-loaded node, round-robin ties, capacity-aware)
+        self._fair_scheduler = FairScheduler()
 
         # Federation registry
         self._federation_lock = threading.Lock()
@@ -144,6 +152,12 @@ class ClusterState:
                         self._on_capability_change(node_id, old_caps, caps)
                     except Exception:
                         pass
+
+    def update_max_concurrent(self, node_id: str, max_concurrent: int) -> None:
+        """Update a node's concurrency ceiling (re-join may re-declare it)."""
+        with self._nodes_lock:
+            if node_id in self._nodes:
+                self._nodes[node_id].max_concurrent = max(0, int(max_concurrent))
 
     def node_count(self) -> int:
         with self._nodes_lock:
@@ -246,19 +260,23 @@ class ClusterState:
         This is the proper way to unassign a task — it avoids the race
         condition of separate set_task_status + direct attribute access.
         Returns True if the task existed and was not terminal (B1).
+
+        Lease guard (#833): a task whose lease is still active is never
+        unassigned. A lease is exclusive ownership — recovery revokes the
+        lease first, then calls this; the guard makes the invariant hold
+        even for callers that would otherwise move a running task out from
+        under a live worker.
         """
         with self._tasks_lock:
             if task_id not in self._tasks:
                 return False
             task = self._tasks[task_id]
             # Terminal-state guard (B1): do not revive a terminal task
-            _terminal = {
-                TaskStatus.completed,
-                TaskStatus.failed,
-                TaskStatus.cancelled,
-                TaskStatus.cancel_requested,
-            }
-            if task.status in _terminal:
+            if task.status in TERMINAL_TASK_STATUSES:
+                return False
+            # Live-lease guard: a worker owns this task — do not make it
+            # schedulable again while its lease is alive.
+            if self.get_lease_by_task(task_id) is not None:
                 return False
             task.assigned_to = None
             task.status = TaskStatus.ready
@@ -422,6 +440,21 @@ class ClusterState:
                 if lease.status == LeaseStatus.expired
             ]
 
+    def _active_leased_task_ids(self) -> set:
+        """Task IDs holding a not-yet-expired ACTIVE lease (read-only).
+
+        Deliberately does NOT call ``get_active_leases()``: that method
+        marks expired leases and fires the expiry callback (recovery) as a
+        side effect, which the scheduler must not trigger.
+        """
+        now = datetime.utcnow()
+        with self._leases_lock:
+            return {
+                lease.task_id
+                for lease in self._leases.values()
+                if lease.status is LeaseStatus.active and lease.expires_at > now
+            }
+
     # -----------------------------------------------------------------------
     # Sync state
     # -----------------------------------------------------------------------
@@ -577,45 +610,93 @@ class ClusterState:
         return promoted
 
     def schedule_pending(self) -> int:
-        """Try to assign ready tasks to available nodes. Returns count scheduled."""
-        scheduled = 0
-        # Get available nodes
+        """Assign ready tasks to capable online nodes. Returns count scheduled.
+
+        Fairness fix (#833): routes through the shared planner so the node
+        with the fewest active tasks wins and ties rotate round-robin —
+        previously the first capability-matching node took everything.
+        """
+        return len(self.schedule_pending_detailed())
+
+    def schedule_pending_detailed(self) -> List[Dict[str, Any]]:
+        """Assign ready tasks to the least-loaded capable online node.
+
+        Returns the NEW assignments made by this call (one dict per task:
+        ``task_id``/``task_title``/``node_id``/``priority``). The trigger
+        endpoint uses this so ``POST /schedule/trigger`` reports only the
+        work it actually scheduled — not every running task in the cluster.
+
+        Rules (see ``hermes_cluster/core/scheduler.py``):
+          - only ONLINE nodes
+          - fewest active tasks, ties -> round-robin (least-recently picked)
+          - never exceed a node's ``max_concurrent`` (0 = unlimited)
+          - never (re-)assign a task whose lease is still active
+        """
+        new_assignments: List[Dict[str, Any]] = []
+
         with self._nodes_lock:
-            online_nodes = [n for n in self._nodes.values() if n.status == NodeStatus.online]
-
+            online_nodes = [
+                n for n in self._nodes.values() if n.status == NodeStatus.online
+            ]
         if not online_nodes:
-            return 0
+            return new_assignments
 
-        # Sort ready tasks by priority (1=highest first), then by creation time
+        # Tasks that still hold an active lease must not be re-assigned.
+        leased_task_ids = self._active_leased_task_ids()
+
         with self._tasks_lock:
-            # The ready-status filter already excludes cancel_requested/cancelled;
-            # terminality is enforced in set_task_status (B1).
+            # Per-node active load from tasks currently assigned to each node.
+            active_counts: Dict[str, int] = {}
+            for t in self._tasks.values():
+                if t.status in ACTIVE_TASK_STATUSES and t.assigned_to:
+                    active_counts[t.assigned_to] = (
+                        active_counts.get(t.assigned_to, 0) + 1
+                    )
+
+            # Sort ready tasks by priority (1=highest first), then creation time.
             ready_tasks = sorted(
-                [t for t in self._tasks.values()
-                 if t.status == TaskStatus.ready],
+                [
+                    t for t in self._tasks.values()
+                    if t.status == TaskStatus.ready and t.id not in leased_task_ids
+                ],
                 key=lambda t: (t.priority, t.created_at),
             )
+
             for task in ready_tasks:
-                # Simple round-robin: assign to first available node with matching capabilities
-                for node in online_nodes:
-                    if not task.requires or all(cap in node.capabilities for cap in task.requires):
-                        task.status = TaskStatus.running
-                        task.assigned_to = node.id
-                        task.updated_at = datetime.utcnow()
-                        task.version += 1
-                        # Record decision
-                        decision = SchedulingDecision(
-                            task_id=task.id,
-                            task_title=task.title,
-                            priority=task.priority,
-                            node_id=node.id,
-                            score=1.0,
-                            reason="capability_match",
-                        )
-                        self.record_decision(decision)
-                        scheduled += 1
-                        break
-        return scheduled
+                node = self._fair_scheduler.choose(
+                    task.requires, online_nodes, active_counts
+                )
+                if node is None:
+                    # No candidate has spare capacity (or none matches caps):
+                    # leave the task ready for a later trigger.
+                    continue
+
+                task.status = TaskStatus.running
+                task.assigned_to = node.id
+                task.updated_at = datetime.utcnow()
+                task.version += 1
+                active_counts[node.id] = active_counts.get(node.id, 0) + 1
+                self._fair_scheduler.mark_picked(node.id)
+
+                # Record decision
+                decision = SchedulingDecision(
+                    task_id=task.id,
+                    task_title=task.title,
+                    priority=task.priority,
+                    node_id=node.id,
+                    score=1.0,
+                    reason="least_loaded_capability_match",
+                )
+                self.record_decision(decision)
+
+                new_assignments.append({
+                    "task_id": task.id,
+                    "task_title": task.title,
+                    "node_id": node.id,
+                    "priority": task.priority,
+                })
+
+        return new_assignments
 
     # -----------------------------------------------------------------------
     # Federation registry

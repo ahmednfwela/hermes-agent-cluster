@@ -188,11 +188,17 @@ def create_app(
     # store and the main never sees it.
     if node_role == "worker" and cluster_endpoint:
         from .core.worker_connector import start_worker_connector
+        # Declare the worker's concurrency ceiling at /join so the main's
+        # scheduler never assigns more tasks than this node can run (#833).
+        _worker_max_concurrent = int(
+            (agent_executor_config or {}).get("max_concurrent", 1)
+        )
         start_worker_connector(
             node_id=state.node_id,
             cluster_endpoint=cluster_endpoint,
             capabilities=node_capabilities or [],
             peer_token=fed_token,
+            max_concurrent=_worker_max_concurrent,
         )
 
     # Agent executor: when role=worker and agent_executor is configured+enabled,
