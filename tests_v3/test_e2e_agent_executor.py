@@ -126,8 +126,9 @@ def test_e2e_lifecycle():
 
     def mock_popen(cmd, **kwargs):
         if any("bdaya-dispatch" in str(c) for c in cmd):
+            # bdaya-dispatch run backgrounds the lane and exits 0 immediately
             return original_popen(
-                [sys.executable, "-c", "import time; time.sleep(1); print('task done')"],
+                [sys.executable, "-c", "print('lane dispatched')"],
                 **kwargs,
             )
         return original_popen(cmd, **kwargs)
@@ -166,6 +167,17 @@ def test_e2e_lifecycle():
 
     ae_module._signed_request = mock_signed_request
 
+    # Mock _query_all_lane_statuses to simulate lane lifecycle
+    lane_state = {"_done": False}
+
+    def mock_query_lane_statuses():
+        # After first poll, simulate the lane completing
+        if lane_state.get("_done"):
+            return {f"hermes-{task_id}": "done"}
+        return {f"hermes-{task_id}": "working"}
+
+    executor._query_all_lane_statuses = mock_query_lane_statuses
+
     print()
     print("[..] Running executor poll cycle...")
 
@@ -173,10 +185,8 @@ def test_e2e_lifecycle():
     executor._poll_once()
     print(f"[OK] After poll: active_spawns={executor.active_count}")
 
-    # 7. Wait for the mock spawn to finish (1 second)
-    time.sleep(3)
-
-    # 8. Run another poll cycle — should reap the finished spawn and report completion
+    # 7. Mark lane as done and run another poll cycle
+    lane_state["_done"] = True
     executor._poll_once()
 
     # 9. Check final task state — ASSERT the outcome (B1 fix)

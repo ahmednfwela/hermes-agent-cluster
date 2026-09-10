@@ -434,46 +434,94 @@ class AgentExecutor:
     # -------------------------------------------------------------------
 
     def _reap_finished_spawns(self) -> None:
-        """Check if any spawned processes have exited and report results."""
-        finished = []
+        """Poll lane status for active spawns and report terminal states.
+
+        bdaya-dispatch run backgrounds the lane and exits 0 immediately, so
+        process exit codes are NOT useful for completion detection. Instead,
+        query ``bdaya-dispatch status --json`` and inspect the lane state.
+        """
+        if not self._active_spawns:
+            return
+
+        lane_states = self._query_all_lane_statuses()
+
+        resolved = []  # (task_id, spawn, outcome, detail)
         with self._lock:
-            for task_id, spawn in self._active_spawns.items():
-                rc = spawn.process.poll()
-                if rc is not None:
-                    finished.append((task_id, spawn, rc))
-                elif time.time() - spawn.started_at > self._config.spawn_timeout:
-                    # Timeout — kill the process
+            for task_id, spawn in list(self._active_spawns.items()):
+                elapsed = time.time() - spawn.started_at
+
+                # Outer timeout bound
+                if elapsed > self._config.spawn_timeout:
                     logger.warning(
-                        "spawn timeout (%.0fs) for task %s, killing pid %d",
+                        "spawn timeout (%.0fs) for task %s (lane=%s)",
                         self._config.spawn_timeout,
                         task_id,
-                        spawn.process.pid,
+                        spawn.lane_name,
                     )
-                    try:
-                        spawn.process.kill()
-                    except OSError:
-                        pass
-                    finished.append((task_id, spawn, -1))
+                    resolved.append((task_id, spawn, "timeout", f"exceeded {self._config.spawn_timeout:.0f}s"))
+                    continue
 
-        for task_id, spawn, rc in finished:
+                state = lane_states.get(spawn.lane_name)
+                if state is None:
+                    # Lane not found in status output — treat as missing
+                    logger.warning("lane %s not found in status output", spawn.lane_name)
+                    resolved.append((task_id, spawn, "missing", "lane not found in bdaya-dispatch status"))
+                    continue
+
+                if state == "done":
+                    resolved.append((task_id, spawn, "done", f"lane completed in {elapsed:.0f}s"))
+                elif state in ("blocked", "stopped", "failed"):
+                    resolved.append((task_id, spawn, state, f"lane state={state} after {elapsed:.0f}s"))
+
+        for task_id, spawn, outcome, detail in resolved:
             with self._lock:
                 self._active_spawns.pop(task_id, None)
 
-            if rc == 0:
+            if outcome == "done":
                 self._report_completion(task_id)
             else:
-                # Try to capture last lines of output for the failure reason
-                reason = f"worker exited with code {rc}"
-                try:
-                    if spawn.process.stdout:
-                        tail = spawn.process.stdout.read()
-                        if tail:
-                            lines = tail.decode(errors="replace").strip().split("\n")
-                            tail_text = "\n".join(lines[-5:])  # last 5 lines
-                            reason = f"worker exited with code {rc}: {tail_text[:500]}"
-                except Exception:
-                    pass
-                self._report_failure(task_id, reason)
+                self._report_failure(task_id, f"lane {spawn.lane_name}: {detail}")
+
+    def _query_all_lane_statuses(self) -> Dict[str, str]:
+        """Run ``bdaya-dispatch status --json`` and return {lane_name: state}."""
+        cmd = [
+            "npx", "-y",
+            "-p", self._config.bdaya_dispatch_package,
+            "bdaya-dispatch", "status", "--json",
+        ]
+        env = dict(os.environ)
+        env.setdefault(
+            "CLAUDE_CONFIG_DIR",
+            str(Path.home() / ".claude-profiles" / self._config.profile),
+        )
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                cwd=self._config.working_dir or None,
+                env=env,
+            )
+            if result.returncode != 0:
+                logger.warning("bdaya-dispatch status failed (rc=%d): %s",
+                               result.returncode, result.stderr[:200] if result.stderr else "")
+                return {}
+            data = json.loads(result.stdout)
+            return {
+                lane["lane"]: lane["state"]
+                for lane in data.get("lanes", [])
+                if "lane" in lane and "state" in lane
+            }
+        except subprocess.TimeoutExpired:
+            logger.warning("bdaya-dispatch status timed out")
+            return {}
+        except (json.JSONDecodeError, KeyError) as e:
+            logger.warning("failed to parse bdaya-dispatch status: %s", e)
+            return {}
+        except FileNotFoundError:
+            logger.warning("npx not found when querying lane status")
+            return {}
 
     # -------------------------------------------------------------------
     # Lease renewal
