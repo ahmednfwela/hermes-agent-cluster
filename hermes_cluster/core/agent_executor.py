@@ -45,6 +45,7 @@ import hashlib
 import hmac
 import json
 import logging
+import errno
 import os
 import shutil
 import subprocess
@@ -149,6 +150,20 @@ class _ResumedProcess:
             self._exited = True
             return 0
         except PermissionError:
+            return None
+        except OSError as exc:
+            # Windows has no ESRCH for this probe: os.kill(<dead pid>, 0)
+            # raises OSError errno 22 / WinError 87 ("The parameter is
+            # incorrect"), measured on Windows 11 + CPython 3.13. Swallowing
+            # it as "unknown" made poll() return None forever, so a
+            # reconciled spawn could never report an exit. Treat it as
+            # process-gone, matching ProcessLookupError on POSIX.
+            if os.name == "nt" and (
+                getattr(exc, "winerror", None) == 87
+                or exc.errno == errno.EINVAL
+            ):
+                self._exited = True
+                return 0
             return None
         except Exception:
             # os.kill can raise on invalid pid kinds; treat as unknown → alive
@@ -1072,9 +1087,14 @@ class AgentExecutor:
                         setattr(spawn, attr, None)
 
         # Result file is the primary completion signal for hermes: the agent
-        # writes its final response there, then exits 0.
+        # writes its final response there, then exits 0. The file is the
+        # child's STDOUT, so content alone proves nothing while the process is
+        # alive — startup warnings (e.g. "Warning: Unknown toolsets: …") land
+        # there within seconds and used to mark a live lane done, freeing its
+        # lane slot while the agent kept running (shared/claude-plugins#851).
+        # A lane is done only once it has EXITED cleanly with content.
         result_ok = bool(spawn.result_path) and Path(spawn.result_path).is_file()
-        if result_ok:
+        if rc == 0 and result_ok:
             try:
                 contents = Path(spawn.result_path).read_text(
                     encoding="utf-8", errors="replace"
