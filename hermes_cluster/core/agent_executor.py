@@ -1072,9 +1072,14 @@ class AgentExecutor:
                         setattr(spawn, attr, None)
 
         # Result file is the primary completion signal for hermes: the agent
-        # writes its final response there, then exits 0.
+        # writes its final response there, then exits 0. The file is the
+        # child's STDOUT, so content alone proves nothing while the process is
+        # alive — startup warnings (e.g. "Warning: Unknown toolsets: …") land
+        # there within seconds and used to mark a live lane done, freeing its
+        # lane slot while the agent kept running (shared/claude-plugins#851).
+        # A lane is done only once it has EXITED cleanly with content.
         result_ok = bool(spawn.result_path) and Path(spawn.result_path).is_file()
-        if result_ok:
+        if rc == 0 and result_ok:
             try:
                 contents = Path(spawn.result_path).read_text(
                     encoding="utf-8", errors="replace"

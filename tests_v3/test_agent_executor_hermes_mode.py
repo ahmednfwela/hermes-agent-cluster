@@ -198,6 +198,35 @@ class TestHermesReap:
 
         assert resolved and resolved[0][2] == "no_result"
 
+    def test_not_done_while_running_even_if_stdout_has_content(self, tmp_path):
+        """#851/3: the result file is the child's stdout — a startup warning
+        must NOT resolve a still-running lane as done."""
+        executor = _executor(spawn_timeout=3600)
+        result_path = tmp_path / "noisy.md"
+        result_path.write_text(
+            "Warning: Unknown toolsets: bdaya-gitlab, bdaya-lsp, bdaya_gcp\n",
+            encoding="utf-8",
+        )
+        spawn = _hermes_spawn("t_noisy", result_path=str(result_path))
+        spawn.process.poll.return_value = None  # still running
+
+        resolved = []
+        executor._reap_hermes_spawn("t_noisy", spawn, 30.0, resolved)
+
+        assert resolved == []
+
+    def test_done_only_after_exit_with_content(self, tmp_path):
+        executor = _executor(spawn_timeout=3600)
+        result_path = tmp_path / "noisy_done.md"
+        result_path.write_text("Warning: x\nfinal answer\n", encoding="utf-8")
+        spawn = _hermes_spawn("t_noisy_done", result_path=str(result_path))
+        spawn.process.poll.return_value = 0
+
+        resolved = []
+        executor._reap_hermes_spawn("t_noisy_done", spawn, 30.0, resolved)
+
+        assert resolved and resolved[0][2] == "done"
+
     def test_timeout_when_still_running(self, tmp_path):
         executor = _executor(worker="hermes", spawn_timeout=10.0)
         result_path = tmp_path / "run.md"
