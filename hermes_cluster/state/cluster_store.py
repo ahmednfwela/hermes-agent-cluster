@@ -116,6 +116,9 @@ CREATE TABLE IF NOT EXISTS tasks (
 -- Stateful lanes: one row per lane_key, keyed to the hermes session it owns.
 -- A task whose lane_key has a live row RESUMES that hermes session instead of
 -- spawning a fresh one (shared/claude-plugins#847/#833; PR#16 stateful-lanes).
+-- last_active_at (epoch seconds) records the lane's most recent activity
+-- (delivery spawn or completion); the executor reaps a lane idle past
+-- agent_executor.lane_idle_timeout by clearing this row (PR#16 round 1).
 CREATE TABLE IF NOT EXISTS lanes (
     lane_key TEXT PRIMARY KEY,
     session_id TEXT DEFAULT '',
@@ -123,6 +126,7 @@ CREATE TABLE IF NOT EXISTS lanes (
     role TEXT DEFAULT 'author',
     node TEXT DEFAULT '',
     created_at REAL NOT NULL,
+    last_active_at REAL DEFAULT 0,
     last_task_id TEXT DEFAULT ''
 );
 
@@ -322,9 +326,19 @@ class ClusterStore:
                         role TEXT DEFAULT 'author',
                         node TEXT DEFAULT '',
                         created_at REAL NOT NULL,
+                        last_active_at REAL DEFAULT 0,
                         last_task_id TEXT DEFAULT ''
                     )"""
                 )
+            else:
+                # Idle-lane reaping needs a last-activity clock (round 1).
+                cols = [r[1] for r in self._conn.execute(
+                    "PRAGMA table_info(lanes)"
+                ).fetchall()]
+                if "last_active_at" not in cols:
+                    self._conn.execute(
+                        "ALTER TABLE lanes ADD COLUMN last_active_at REAL DEFAULT 0"
+                    )
         except Exception as e:
             logger.warning("lanes table migration skipped: %s", e)
 
@@ -1238,9 +1252,14 @@ class ClusterStore:
         role: str = "author",
         node: str = "",
         created_at: Optional[float] = None,
+        last_active_at: Optional[float] = None,
         last_task_id: str = "",
     ) -> None:
-        """Upsert a lane record by lane_key (first created_at always wins)."""
+        """Upsert a lane record by lane_key (first created_at always wins).
+
+        ``last_active_at`` is refreshed on every upsert (default: now) so the
+        executor's idle reaper can measure the lane's idle time.
+        """
         with self._tx() as conn:
             row = conn.execute(
                 "SELECT created_at FROM lanes WHERE lane_key = ?", (lane_key,)
@@ -1250,12 +1269,14 @@ class ClusterStore:
                 if row
                 else (created_at if created_at is not None else time.time())
             )
+            effective_active = last_active_at if last_active_at is not None else time.time()
             conn.execute(
                 """INSERT OR REPLACE INTO lanes
-                   (lane_key, session_id, profile, role, node, created_at, last_task_id)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                   (lane_key, session_id, profile, role, node, created_at,
+                    last_active_at, last_task_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (lane_key, session_id, profile, role, node,
-                 effective_created, last_task_id),
+                 effective_created, effective_active, last_task_id),
             )
 
     def get_lane(self, lane_key: str) -> Optional[dict]:

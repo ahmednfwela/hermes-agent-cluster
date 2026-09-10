@@ -388,6 +388,153 @@ class TestRestartReattachByLaneKey:
 
 
 # ---------------------------------------------------------------------------
+# lane_idle_timeout: idle-lane reaping (lead requirement 2026-09-10, #833)
+# ---------------------------------------------------------------------------
+
+class TestLaneIdleTimeout:
+    """``agent_executor.lane_idle_timeout`` (default 6 h): an idle lane — no
+    delivery running, last activity older than the timeout — is REAPED: its
+    hermes session is left intact on disk, but the ``lanes`` row is cleared so
+    the next task with that lane_key starts fresh.
+
+    ``spawn_timeout`` bounds the per-task DELIVERY only; the lane itself is
+    long-lived by design. A lane alive for 3x ``spawn_timeout`` with two
+    completed deliveries is never failed or reaped."""
+
+    def test_lane_alive_3x_spawn_timeout_never_failed_or_reaped(
+        self, monkeypatch, tmp_path
+    ):
+        """spawn_timeout is a per-delivery bound, NOT a lane lifetime bound: a
+        lane alive for 3× spawn_timeout whose last activity is recent is
+        neither failed nor reaped."""
+        captured = []
+
+        class _P:
+            pid = 88
+            stderr = None
+            stdout = None
+            def __init__(self, results=None):
+                self._results = list(results or [0])
+            def poll(self):
+                return self._results.pop(0) if self._results else None
+
+        def fake_popen(cmd, **kw):
+            captured.append(list(cmd))
+            return _P()
+
+        monkeypatch.setattr(
+            "hermes_cluster.core.agent_executor.subprocess.Popen", fake_popen
+        )
+
+        store = _store()
+        # Lane owns a long-lived session: created 3x spawn_timeout ago, still
+        # touched recently (its last delivery reaped at 'now').
+        now = time.time()
+        store.record_lane(
+            "L", session_id="sid_old", role="author", node="n1",
+            created_at=now - 3 * 10,  # 3× spawn_timeout (10s) old
+            last_active_at=now,       # fresh activity — NOT idle
+            last_task_id="t1",
+        )
+        # lane_idle_timeout is between the lane's created age (30s) and its
+        # actual idle age (0s): ONLY a reaper keyed on last ACTIVITY (not lane
+        # created age) keeps the lane — that is the mutation guard.
+        executor = _executor_with_store(
+            store, spawn_timeout=10.0, lane_idle_timeout=20.0,
+            working_dir=str(tmp_path),
+        )
+
+        # Two completed deliveries on that lane (each within spawn_timeout).
+        for i, tid in enumerate(("t1", "t2")):
+            result = tmp_path / "hermes-results" / f"{tid}.result.md"
+            result.parent.mkdir(parents=True, exist_ok=True)
+            result.write_text(f"answer {i}", encoding="utf-8")
+            err = tmp_path / "hermes-results" / f"{tid}.stderr.log"
+            err.parent.mkdir(parents=True, exist_ok=True)
+            err.write_text("session_id: sid_lane\n", encoding="utf-8")
+            spawn = ActiveSpawn(
+                task_id=tid, task_title=tid, process=_P([0]),
+                started_at=now - 1, lane_name=f"hermes-{tid}", mode="hermes",
+                result_path=str(result), stderr_path=str(err),
+                lane_key="L", role="author", session_id="sid_old",
+            )
+            with executor._lock:
+                executor._active_spawns[tid] = spawn
+        with patch.object(executor, "_capture_spawn_exits"):
+            with patch.object(executor, "_report_completion"):
+                with patch.object(executor, "_report_failure") as mock_fail:
+                    executor._reap_finished_spawns()
+                    mock_fail.assert_not_called()
+        # Both deliveries reaped as done, no failures despite lane age 3x.
+        assert store.get_task_spawn("t1") is None
+        assert store.get_task_spawn("t2") is None
+        assert store.get_lane("L") is not None  # lane survives completions
+
+        # Lane alive 3x spawn_timeout is NOT reaped (recent activity).
+        reaped = executor._reap_idle_lanes()
+        assert reaped == 0
+        assert store.get_lane("L") is not None
+
+    def test_idle_lane_past_lane_idle_timeout_is_reaped(self, tmp_path):
+        """An idle lane past lane_idle_timeout IS reaped and its record
+        cleared; a recently-active lane survives."""
+        store = _store()
+        now = time.time()
+        store.record_lane(
+            "idle", session_id="sid_idle", role="author",
+            last_active_at=now - 5000,  # idle well past a 100s timeout
+            last_task_id="t_old",
+        )
+        store.record_lane(
+            "busy", session_id="sid_busy", role="author",
+            last_active_at=now - 10,  # recent activity
+            last_task_id="t_new",
+        )
+        executor = _executor_with_store(store, lane_idle_timeout=100.0)
+
+        reaped = executor._reap_idle_lanes()
+
+        assert reaped == 1
+        assert store.get_lane("idle") is None       # record cleared
+        assert store.get_lane("busy") is not None   # recent activity survives
+
+    def test_idle_lane_with_running_delivery_not_reaped(self, monkeypatch, tmp_path):
+        """A lane with an in-flight delivery is NOT idle — never reaped even
+        when its last_active_at is old."""
+        store = _store()
+        now = time.time()
+        store.record_lane(
+            "inflight", session_id="sid_run", role="author",
+            last_active_at=now - 5000, last_task_id="t_run",
+        )
+
+        class _P:
+            pid = 91
+            stderr = None
+            stdout = None
+            def poll(self): return None  # still running
+
+        monkeypatch.setattr(
+            "hermes_cluster.core.agent_executor.subprocess.Popen",
+            lambda cmd, **kw: _P())
+        executor = _executor_with_store(
+            store, lane_idle_timeout=100.0, working_dir=str(tmp_path),
+        )
+        # An active spawn pins the lane.
+        spawn = ActiveSpawn(
+            task_id="t_run", task_title="running",
+            process=_P(), started_at=now, lane_name="hermes-t_run",
+            mode="hermes", result_path="", lane_key="inflight", role="author",
+        )
+        with executor._lock:
+            executor._active_spawns["t_run"] = spawn
+
+        reaped = executor._reap_idle_lanes()
+        assert reaped == 0
+        assert store.get_lane("inflight") is not None
+
+
+# ---------------------------------------------------------------------------
 # F1: timeout kills the orphaned child
 # ---------------------------------------------------------------------------
 

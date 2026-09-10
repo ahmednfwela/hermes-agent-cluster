@@ -73,6 +73,12 @@ class AgentExecutorConfig:
     poll_interval: float = 15.0  # seconds between poll cycles
     max_concurrent: int = 1  # max simultaneous spawns
     spawn_timeout: float = 1800.0  # max seconds per spawn (30 min)
+    # Max idle seconds before a STATEFUL LANE is reaped (its lanes row cleared,
+    # hermes session left intact on disk). ``spawn_timeout`` bounds a single
+    # DELIVERY; ``lane_idle_timeout`` bounds how long a lane may sit idle with
+    # no delivery running. Default 6 hours (six-hour default per the lead
+    # requirement, shared/claude-plugins#833 2026-09-10).
+    lane_idle_timeout: float = 21600.0
     working_dir: str = ""  # working directory for spawned workers
     hermes_profile: str = "default"  # hermes -p/--profile (hermes worker mode)
     hermes_bin: str = ""  # path to the hermes CLI; empty → resolve at spawn
@@ -341,6 +347,11 @@ class AgentExecutor:
         """Single poll cycle: check results, find new tasks, renew leases."""
         # 1. Check completed/failed spawns
         self._reap_finished_spawns()
+
+        # 1b. Reap idle stateful lanes (lead requirement, #833 2026-09-10):
+        # a lane idle past lane_idle_timeout has its lanes row cleared so the
+        # next task with that lane_key starts fresh (session left on disk).
+        self._reap_idle_lanes()
 
         # 2. Renew leases for active spawns
         self._renew_leases()
@@ -1198,6 +1209,60 @@ class AgentExecutor:
                 )
         except Exception:
             logger.exception("failed to record lane session for lane %s", spawn.lane_key)
+
+    def _reap_idle_lanes(self) -> int:
+        """Reap stateful lanes idle past ``lane_idle_timeout``.
+
+        A lane is idle when NO delivery is currently running for it AND its
+        last activity (``last_active_at``, falling back to ``created_at``) is
+        older than ``agent_executor.lane_idle_timeout`` (default 6 h). Reaping
+        clears the ``lanes`` ROW only — the hermes session itself is left
+        intact on disk (``--resume``/``-c`` can still re-attach) — so the next
+        task with that lane_key starts fresh. Returns the number of lanes
+        reaped.
+        """
+        store = getattr(self, "_store", None)
+        if store is None or not getattr(store, "get_all_lanes", None):
+            return 0
+        timeout = getattr(self._config, "lane_idle_timeout", 21600.0)
+        if timeout <= 0:
+            return 0
+        try:
+            lanes = store.get_all_lanes()
+        except Exception:
+            logger.exception("failed to list lanes during idle reap")
+            return 0
+
+        # A lane with an in-flight delivery is NOT idle — keep it.
+        with self._lock:
+            busy_lane_keys = {
+                s.lane_key for s in self._active_spawns.values() if s.lane_key
+            }
+
+        reaped = 0
+        now = time.time()
+        for lane in lanes:
+            lane_key = lane.get("lane_key", "")
+            if not lane_key or lane_key in busy_lane_keys:
+                continue
+            last_active = lane.get("last_active_at") or lane.get("created_at") or 0
+            try:
+                idle_seconds = now - float(last_active)
+            except (TypeError, ValueError):
+                idle_seconds = float("inf")
+            if idle_seconds <= timeout:
+                continue
+            try:
+                if store.delete_lane(lane_key):
+                    reaped += 1
+                    logger.info(
+                        "reaped idle stateful lane %s (idle %.0fs > %.0fs) — "
+                        "lanes row cleared, hermes session left on disk",
+                        lane_key, idle_seconds, timeout,
+                    )
+            except Exception:
+                logger.exception("failed to reap idle lane %s", lane_key)
+        return reaped
 
     def _query_all_lane_statuses(self) -> Optional[Dict[str, str]]:
         """Run ``bdaya-dispatch status --json`` and return {lane_name: state}.

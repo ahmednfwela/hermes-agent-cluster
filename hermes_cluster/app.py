@@ -210,6 +210,7 @@ def create_app(
                 poll_interval=float(ae_cfg_dict.get("poll_interval", 15)),
                 max_concurrent=int(ae_cfg_dict.get("max_concurrent", 1)),
                 spawn_timeout=float(ae_cfg_dict.get("spawn_timeout", 1800)),
+                lane_idle_timeout=float(ae_cfg_dict.get("lane_idle_timeout", 21600)),
                 working_dir=ae_cfg_dict.get("working_dir", ""),
                 hermes_profile=ae_cfg_dict.get("hermes_profile", "default"),
                 hermes_bin=ae_cfg_dict.get("hermes_bin", ""),

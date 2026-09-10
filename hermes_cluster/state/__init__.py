@@ -745,13 +745,19 @@ class ClusterState:
 
     def record_lane(self, lane_key: str, session_id: str = "", profile: str = "",
                     role: str = "author", node: str = "", created_at: Optional[float] = None,
+                    last_active_at: Optional[float] = None,
                     last_task_id: str = "") -> None:
-        """Upsert a lane record by lane_key (first created_at always wins)."""
+        """Upsert a lane record by lane_key (first created_at always wins).
+
+        ``last_active_at`` is refreshed on every upsert (default: now) so the
+        executor's idle reaper can measure the lane's idle time.
+        """
         with self._task_spawns_lock:
             existing = self._lanes.get(lane_key)
             effective_created = (
                 existing.get("created_at") if existing
                 else (created_at if created_at is not None else time.time()))
+            effective_active = last_active_at if last_active_at is not None else time.time()
             self._lanes[lane_key] = {
                 "lane_key": lane_key,
                 "session_id": session_id,
@@ -759,6 +765,7 @@ class ClusterState:
                 "role": role,
                 "node": node,
                 "created_at": effective_created,
+                "last_active_at": effective_active,
                 "last_task_id": last_task_id,
             }
 
