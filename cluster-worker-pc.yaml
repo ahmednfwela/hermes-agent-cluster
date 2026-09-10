@@ -40,6 +40,9 @@ agent_executor:
   # only used in hermes worker mode: `hermes -p <hermes_profile> chat --query-file ...`
   hermes_profile: default
   hermes_bin: ""
+  # reviewer role passes -m <hermes_reviewer_model> (opus tier) so the merge
+  # gate accepts its verdicts; author lanes use the profile default (no -m).
+  hermes_reviewer_model: "qwen3.7-plus"
   poll_interval: 15
   max_concurrent: 1
   spawn_timeout: 1800

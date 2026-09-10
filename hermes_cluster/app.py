@@ -213,6 +213,7 @@ def create_app(
                 working_dir=ae_cfg_dict.get("working_dir", ""),
                 hermes_profile=ae_cfg_dict.get("hermes_profile", "default"),
                 hermes_bin=ae_cfg_dict.get("hermes_bin", ""),
+                hermes_reviewer_model=ae_cfg_dict.get("hermes_reviewer_model", "qwen3.7-plus"),
             )
             _agent_executor = AgentExecutor(
                 config=ae_cfg,

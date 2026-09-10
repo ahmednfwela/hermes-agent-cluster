@@ -97,6 +97,8 @@ class ClusterState:
         # Agent executor spawn tracking (task -> lane map)
         self._task_spawns_lock = threading.Lock()
         self._task_spawns: Dict[str, dict] = {}
+        # Stateful lanes (lane_key -> hermes session map)
+        self._lanes: Dict[str, dict] = {}
 
         # Server info
         self.started_at: datetime = datetime.utcnow()
@@ -171,7 +173,15 @@ class ClusterState:
     # Task store
     # -----------------------------------------------------------------------
 
-    def create_task(self, task_id: str, title: str, requires: List[str], priority: int = 3) -> Task:
+    def create_task(
+        self,
+        task_id: str,
+        title: str,
+        requires: List[str],
+        priority: int = 3,
+        lane_key: str = "",
+        role: str = "author",
+    ) -> Task:
         now = datetime.utcnow()
         task = Task(
             id=task_id,
@@ -182,6 +192,8 @@ class ClusterState:
             created_at=now,
             updated_at=now,
             version=1,
+            lane_key=lane_key,
+            role=role,
         )
         with self._tasks_lock:
             self._tasks[task_id] = task
@@ -694,6 +706,9 @@ class ClusterState:
         lease_id: str = "",
         lane_name: str = "",
         result_path: str = "",
+        lane_key: str = "",
+        role: str = "author",
+        session_id: str = "",
     ) -> None:
         """Persist a task spawn record (in-memory mirror of ClusterStore)."""
         with self._task_spawns_lock:
@@ -706,6 +721,9 @@ class ClusterState:
                 "lease_id": lease_id,
                 "lane_name": lane_name,
                 "result_path": result_path,
+                "lane_key": lane_key,
+                "role": role,
+                "session_id": session_id,
             }
 
     def get_task_spawn(self, task_id: str) -> Optional[dict]:
@@ -720,6 +738,50 @@ class ClusterState:
     def delete_task_spawn(self, task_id: str) -> bool:
         with self._task_spawns_lock:
             return self._task_spawns.pop(task_id, None) is not None
+
+    # -----------------------------------------------------------------------
+    # Stateful lanes (lane_key -> hermes session map)
+    # -----------------------------------------------------------------------
+
+    def record_lane(self, lane_key: str, session_id: str = "", profile: str = "",
+                    role: str = "author", node: str = "", created_at: Optional[float] = None,
+                    last_task_id: str = "") -> None:
+        """Upsert a lane record by lane_key (first created_at always wins)."""
+        with self._task_spawns_lock:
+            existing = self._lanes.get(lane_key)
+            effective_created = (
+                existing.get("created_at") if existing
+                else (created_at if created_at is not None else time.time()))
+            self._lanes[lane_key] = {
+                "lane_key": lane_key,
+                "session_id": session_id,
+                "profile": profile,
+                "role": role,
+                "node": node,
+                "created_at": effective_created,
+                "last_task_id": last_task_id,
+            }
+
+    def get_lane(self, lane_key: str) -> Optional[dict]:
+        with self._task_spawns_lock:
+            record = self._lanes.get(lane_key)
+            return dict(record) if record else None
+
+    def get_all_lanes(self) -> List[dict]:
+        with self._task_spawns_lock:
+            return [dict(r) for r in self._lanes.values()]
+
+    def touch_lane_last_task(self, lane_key: str, task_id: str) -> None:
+        if not lane_key:
+            return
+        with self._task_spawns_lock:
+            lane = self._lanes.get(lane_key)
+            if lane:
+                lane["last_task_id"] = task_id
+
+    def delete_lane(self, lane_key: str) -> bool:
+        with self._task_spawns_lock:
+            return self._lanes.pop(lane_key, None) is not None
 
     # -----------------------------------------------------------------------
     # Config

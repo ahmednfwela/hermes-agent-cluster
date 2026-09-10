@@ -19,6 +19,18 @@ ClusterStore SQLite (``task_spawns`` table) and reconciled on start — a lane
 spawned before a crash is resumed from its record, and a task is re-spawned
 only when no record exists (no duplicate worker after an executor restart).
 
+Stateful lanes (shared/claude-plugins#847/#833, owner ruling 2026-09-10): a
+task carrying ``lane_key`` joins a named stateful lane. The first task with a
+new ``lane_key`` spawns a hermes session titled by the lane_key (``-c
+<lane_key> --create-if-missing``); every later task with that lane_key RESUMES
+the lane's live session (``--resume <session_id>``) and delivers its brief as
+the next message — one hermes session per lane, cheap models (qwen3.8-flash
+profile default for authors), no per-task cold starts. The lane→session map
+lives in the ``lanes`` table (lane_key, session_id, profile, role, node,
+created_at, last_task_id) and is re-attached on worker restart by lane_key.
+Reviewer lanes (``role="reviewer"``) spawn with ``-m <hermes_reviewer_model>``
+(default qwen3.7-plus, the opus tier) so the merge gate accepts their verdicts.
+
 Design:
   - Worker-mode aware spawn + reap, one active spawn per lease at a time
   - Honours lease TTL — renews while the spawn is running
@@ -64,6 +76,9 @@ class AgentExecutorConfig:
     working_dir: str = ""  # working directory for spawned workers
     hermes_profile: str = "default"  # hermes -p/--profile (hermes worker mode)
     hermes_bin: str = ""  # path to the hermes CLI; empty → resolve at spawn
+    # Reviewer lanes pass the opus-tier model explicitly so the merge gate
+    # accepts their verdicts; author lanes use the profile default (no -m).
+    hermes_reviewer_model: str = "qwen3.7-plus"
     bdaya_dispatch_package: str = "@shared/bdaya-dispatch@latest"
 
 
@@ -83,7 +98,12 @@ class ActiveSpawn:
     mode: str = "bdaya-dispatch"  # which worker mode spawned this (matches config.worker)
     result_path: str = ""  # hermes mode: path of the result file the lane writes
     result_file: Optional[object] = None  # open handle for the result file (hermes)
+    stderr_path: str = ""  # hermes mode: path of the child's stderr log
+    stderr_file: Optional[object] = None  # open handle for the stderr log (hermes)
     resumed: bool = False  # True when reconstructed from the persisted spawn map
+    lane_key: str = ""  # stateful lane identity this delivery belongs to
+    role: str = "author"  # author (profile default model) | reviewer (opus tier)
+    session_id: str = ""  # hermes session id this lane maps to (lanes table)
     miss_count: int = 0  # consecutive polls where lane was absent from status
     spawn_exit_rc: Optional[int] = None  # set once spawn process exits
     spawn_exit_stderr: str = ""  # captured stderr tail on nonzero exit
@@ -219,6 +239,10 @@ class AgentExecutor:
         self._thread: Optional[threading.Thread] = None
         self._running = False
         self._reconciled = False
+        # Persisted task-id cache (F4): reconciled once from the store, then
+        # maintained in-memory by _persist_spawn/_drop_persisted_spawn so the
+        # poll loop never re-reads SQLite. Reseeded by reconcile on start.
+        self._persisted_ids: set = set()
 
         # Resolve working directory
         if not self._config.working_dir:
@@ -381,7 +405,14 @@ class AgentExecutor:
         for task in candidates[:max_spawns]:
             self._spawn_worker(task)
 
-    def _write_brief(self, task_id: str, title: str, description: str) -> Path:
+    def _write_brief(
+        self,
+        task_id: str,
+        title: str,
+        description: str,
+        lane_key: str = "",
+        role: str = "author",
+    ) -> Path:
         """Write the per-task brief file the guarded worker lane reads."""
         d = Path(self._config.working_dir or ".") / "hermes-briefs"
         d.mkdir(parents=True, exist_ok=True)
@@ -392,6 +423,15 @@ class AgentExecutor:
             f"**Title:** {title}",
             "",
         ]
+        if lane_key:
+            lines += [
+                f"**Stateful lane:** `{lane_key}` (**{role}** role)",
+                "You are a continuing lane: this task is the next delivery in an existing "
+                "lane session. Read the lane's prior context (you are resuming it), and "
+                "answer THIS brief as the next message. Keep the lane's thread and "
+                "decisions consistent.",
+                "",
+            ]
         if description.strip():
             lines += [description.strip(), ""]
         lines += [
@@ -419,6 +459,8 @@ class AgentExecutor:
         """Spawn a bdaya-dispatch worker for the given task."""
         task_id = task.get("id", "")
         task_title = task.get("title", "")
+        lane_key = task.get("lane_key", "") or ""
+        role = task.get("role", "author") or "author"
 
         # Build the lane name (must be unique and traceable)
         lane_name = f"hermes-{task_id}"
@@ -428,7 +470,10 @@ class AgentExecutor:
         # refused. The goal is the task title (one line); the brief carries the
         # full task text plus the standing lane rules.
         goal = " ".join(task_title.split())[:300] or task_id
-        brief_path = self._write_brief(task_id, task_title, task.get("description") or "")
+        brief_path = self._write_brief(
+            task_id, task_title, task.get("description") or "",
+            lane_key=lane_key, role=role,
+        )
 
         # Spawn: npx -y -p @shared/bdaya-dispatch bdaya-dispatch run
         #   --name <lane_name> --goal <goal> --model <model>
@@ -495,6 +540,8 @@ class AgentExecutor:
             started_at=time.time(),
             lane_name=lane_name,
             mode="bdaya-dispatch",
+            lane_key=lane_key,
+            role=role,
         )
 
         with self._lock:
@@ -526,11 +573,36 @@ class AgentExecutor:
         d.mkdir(parents=True, exist_ok=True)
         return d / f"{task_id}.result.md"
 
+    def _hermes_stderr_path(self, task_id: str) -> Path:
+        """Directory/log file where a native hermes lane's stderr is captured.
+
+        The session id line (``session_id: <id>``) is written to stderr on every
+        exit (cli.py:4087), including success — so stderr is captured to a file,
+        not a PIPE, and parsed on reap (F2). A PIPE would also deadlock a chatty
+        child that floods stderr beyond the buffer while never being drained.
+        """
+        d = Path(self._config.working_dir or ".") / "hermes-results"
+        d.mkdir(parents=True, exist_ok=True)
+        return d / f"{task_id}.stderr.log"
+
+    def _delivery_model_flag(self, role: str) -> List[str]:
+        """Role → model mapping for a native hermes delivery.
+
+        Author lanes use the profile default (no ``-m``); reviewer lanes pass
+        the opus-tier model so the merge gate accepts their verdicts. The ``-m/``
+        ``--model`` flag is accepted both top-level and on ``chat``
+        (hermes_cli/_parser.py:126-128, :211-212); ``qwen3.7-plus`` is the
+        opus-tier catalog entry (hermes_cli/models_catalog_static.py:139).
+        """
+        if role == "reviewer" and self._config.hermes_reviewer_model:
+            return ["-m", self._config.hermes_reviewer_model]
+        return []
+
     def _spawn_hermes_worker(self, task: dict) -> None:
         """Spawn a NATIVE non-interactive hermes session for the given task.
 
         Invocation (verified against hermes_cli on this node — see brief):
-          hermes -p <profile> chat --query-file <brief> -Q
+          hermes -p <profile> chat --query-file <brief> -Q [-m <reviewer model>]
         - ``chat --query-file`` (hermes_cli/_parser.py:194-202) reads the single
           query from a file byte-for-byte (no shell quoting), runs to
           completion, and exits.
@@ -541,14 +613,42 @@ class AgentExecutor:
         - ``-p <profile>`` (hermes_cli/main.py:508-559) is consumed before
           parsing and sets HERMES_HOME for the chosen profile.
 
+        Stateful lanes (task.lane_key): a task whose lane_key already has a
+        live lane RESUMES that hermes session — ``--resume <session_id>``
+        (hermes_cli/_parser.py:227-229; history restored into conversation by
+        ``cli.setup_mixin._preload_resumed_session`` at cli.py:3633/cli_agent_setup_mixin.py:616-660,
+        then the query-file is delivered as the next user message —
+        cli.py:4060). Only a NEW lane_key spawns a fresh session (``-c
+        <lane_key> --create-if-missing``, hermes_cli/_parser.py:235-241 /
+        main.py:1359-1397). Session ids are captured from stderr on reap and
+        recorded in the ``lanes`` table.
+
         Track: pid + exit code + result file (NOT bdaya-dispatch lane status).
         """
         task_id = task.get("id", "")
         task_title = task.get("title", "")
+        lane_key = task.get("lane_key", "") or ""
+        role = task.get("role", "author") or "author"
 
         lane_name = f"hermes-{task_id}"
-        brief_path = self._write_brief(task_id, task_title, task.get("description") or "")
+        brief_path = self._write_brief(
+            task_id, task_title, task.get("description") or "",
+            lane_key=lane_key, role=role,
+        )
         result_path = self._hermes_result_path(task_id)
+        stderr_path = self._hermes_stderr_path(task_id)
+
+        # Stateful lane resolution: resume an existing live lane's session,
+        # else this is the lane's first delivery (fresh titled session).
+        resume_session_id = ""
+        if lane_key:
+            lane = self._store.get_lane(lane_key) if self._store else None
+            if lane and lane.get("session_id"):
+                resume_session_id = lane["session_id"]
+                logger.info(
+                    "lane %s has live session %s — resuming it for task %s",
+                    lane_key, resume_session_id, task_id,
+                )
 
         hermes_bin = self._resolve_hermes_bin()
         cmd = [
@@ -558,32 +658,45 @@ class AgentExecutor:
             "--query-file", str(brief_path),
             "-Q",
         ]
+        cmd[3:3] = self._delivery_model_flag(role)
+        if resume_session_id:
+            cmd.extend(["--resume", resume_session_id])
+        elif lane_key:
+            # First delivery of this lane: create a session titled lane_key so
+            # it can be resumed by name/id later (hermes_cli/main.py:1359-1397).
+            cmd.extend(["-c", lane_key, "--create-if-missing"])
 
         logger.info(
             "spawning native hermes worker for task %s: %s",
             task_id, " ".join(cmd),
         )
 
-        # Hold the result file open for the child's lifetime (closing the
-        # parent handle too early breaks stdout inheritance on Windows).
+        # Hold the result + stderr files open for the child's lifetime (closing
+        # the parent handle too early breaks stdout inheritance on Windows).
         result_file = None
+        stderr_file = None
         try:
             result_file = open(result_path, "w", encoding="utf-8")
+            stderr_file = open(stderr_path, "w", encoding="utf-8")
             proc = subprocess.Popen(
                 cmd,
                 cwd=self._config.working_dir,
                 # Agent final response (stdout) lands in the result file;
-                # the session_id line goes to stderr.
+                # stderr (incl. the session_id line) goes to its own log file.
                 stdout=result_file,
-                stderr=subprocess.PIPE,
+                stderr=stderr_file,
                 # On Windows, create a new process group so we can kill the tree
                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
                 if os.name == "nt"
                 else 0,
             )
         except FileNotFoundError:
-            if result_file is not None:
-                result_file.close()
+            for f in (result_file, stderr_file):
+                if f is not None:
+                    try:
+                        f.close()
+                    except Exception:
+                        pass
             logger.error(
                 "hermes not found — cannot spawn native worker (looked for %s). "
                 "Ensure hermes is installed or set agent_executor.hermes_bin.",
@@ -592,8 +705,12 @@ class AgentExecutor:
             self._report_failure(task_id, "executor_error: hermes not found on PATH")
             return
         except Exception as e:
-            if result_file is not None:
-                result_file.close()
+            for f in (result_file, stderr_file):
+                if f is not None:
+                    try:
+                        f.close()
+                    except Exception:
+                        pass
             logger.error("failed to spawn native hermes worker for task %s: %s", task_id, e)
             self._report_failure(task_id, f"executor_error: {e}")
             return
@@ -610,6 +727,12 @@ class AgentExecutor:
             mode="hermes",
             result_path=str(result_path),
             result_file=result_file,
+            stderr_path=str(stderr_path),
+            stderr_file=stderr_file,
+            lane_key=lane_key,
+            role=role,
+            session_id=resume_session_id,
+            resumed=bool(resume_session_id),
         )
 
         with self._lock:
@@ -630,6 +753,7 @@ class AgentExecutor:
         if getattr(self, "_store", None) is None:
             return
         try:
+            self._persisted_ids.add(spawn.task_id)
             self._store.record_task_spawn(
                 task_id=spawn.task_id,
                 mode=spawn.mode,
@@ -639,19 +763,31 @@ class AgentExecutor:
                 lease_id=spawn.lease_id,
                 lane_name=spawn.lane_name,
                 result_path=spawn.result_path,
+                lane_key=spawn.lane_key,
+                role=spawn.role,
+                session_id=spawn.session_id,
             )
+            # Reflect the lane in the stateful-lanes table whenever a lane_key
+            # exists (session_id filled in later, on reap, from stderr).
+            if spawn.lane_key:
+                self._store.record_lane(
+                    lane_key=spawn.lane_key,
+                    session_id=spawn.session_id,
+                    profile=self._config.hermes_profile,
+                    role=spawn.role,
+                    node=self._node_id,
+                    last_task_id=spawn.task_id,
+                )
         except Exception:
             logger.exception("failed to persist spawn record for task %s", spawn.task_id)
 
     def _persisted_spawn_task_ids(self) -> set:
-        """Task ids with a persisted spawn record (live spawns must not re-spawn)."""
-        if getattr(self, "_store", None) is None:
-            return set()
-        try:
-            return {r["task_id"] for r in self._store.get_all_task_spawns()}
-        except Exception:
-            logger.exception("failed to read persisted spawn records")
-            return set()
+        """Task ids with a persisted spawn record (live spawns must not re-spawn).
+
+        Served from the in-memory cache (F4) — the store is read once at
+        reconcile, then kept in sync by _persist_spawn/_drop_persisted_spawn.
+        """
+        return set(self._persisted_ids)
 
     def _reconcile_persisted_spawns(self) -> None:
         """Re-load the persisted task->lane map into the in-memory spawn table.
@@ -673,11 +809,27 @@ class AgentExecutor:
             self._reconciled = True
             return
         reconstituted = 0
+        # Reseed the persisted-id cache from the store (F4) so the poll loop
+        # never re-reads SQLite per cycle.
+        self._persisted_ids = {r.get("task_id", "") for r in records} - {""}
         with self._lock:
             for record in records:
                 task_id = record.get("task_id", "")
                 if not task_id or task_id in self._active_spawns:
                     continue
+                lane_key = record.get("lane_key") or ""
+                role = record.get("role") or "author"
+                session_id = record.get("session_id") or ""
+                # Worker-restart re-attach by lane_key: if the record does not
+                # carry a session id but the lanes table knows the lane's
+                # session, recover it so a resume (not a fresh spawn) follows.
+                if lane_key and not session_id and getattr(self, "_store", None) is not None:
+                    try:
+                        lane = self._store.get_lane(lane_key)
+                        if lane:
+                            session_id = lane.get("session_id") or ""
+                    except Exception:
+                        logger.exception("failed to read lane %s during reconcile", lane_key)
                 spawn = ActiveSpawn(
                     task_id=task_id,
                     task_title=record.get("job_id") or task_id,
@@ -687,10 +839,26 @@ class AgentExecutor:
                     lane_name=record.get("lane_name") or f"hermes-{task_id}",
                     mode=record.get("mode") or "bdaya-dispatch",
                     result_path=record.get("result_path") or "",
+                    stderr_path=(
+                        record.get("stderr_path")
+                        or str(self._hermes_stderr_path(task_id))
+                        if record.get("mode") == "hermes"
+                        else record.get("stderr_path") or ""
+                    ),
                     resumed=True,
+                    lane_key=lane_key,
+                    role=role,
+                    session_id=session_id,
                 )
                 self._active_spawns[task_id] = spawn
                 reconstituted += 1
+                if lane_key:
+                    # Block a duplicate worker for the lane's task (the spawn is
+                    # live-tracked again, not re-delivered to the same lane).
+                    logger.info(
+                        "reattached lane %s (session %s) to task %s after restart",
+                        lane_key, session_id or "?", task_id,
+                    )
         self._reconciled = True
         if reconstituted:
             logger.info(
@@ -703,6 +871,7 @@ class AgentExecutor:
         if getattr(self, "_store", None) is None:
             return
         try:
+            self._persisted_ids.discard(task_id)
             self._store.delete_task_spawn(task_id)
         except Exception:
             logger.exception("failed to drop persisted spawn record for task %s", task_id)
@@ -832,6 +1001,11 @@ class AgentExecutor:
         for task_id, spawn, outcome, detail in resolved:
             with self._lock:
                 self._active_spawns.pop(task_id, None)
+            # Stateful lane: capture the hermes session id from this delivery's
+            # stderr into the lanes table BEFORE the record is dropped, so the
+            # next task with the same lane_key resumes that session.
+            if outcome == "done" and spawn.mode == "hermes":
+                self._touch_lane_from_spawn(spawn, task_id)
             # A terminal lane's persisted record is dropped so a future run of
             # the same task may spawn again; an active lane's record survives
             # restarts and blocks a duplicate spawn.
@@ -862,16 +1036,19 @@ class AgentExecutor:
         """
         rc = spawn.process.poll()
 
-        # A resolved hermes spawn releases its result-file handle (the child
-        # has exited by then, so the close only releases the parent's copy).
-        if rc is not None and spawn.result_file is not None:
-            try:
-                spawn.result_file.flush()
-                spawn.result_file.close()
-            except Exception:
-                pass
-            finally:
-                spawn.result_file = None
+        # A resolved hermes spawn releases its result/stderr handles (the child
+        # has exited by then, so the close only releases the parent's copies).
+        if rc is not None:
+            for attr in ("result_file", "stderr_file"):
+                fh = getattr(spawn, attr, None)
+                if fh is not None:
+                    try:
+                        fh.flush()
+                        fh.close()
+                    except Exception:
+                        pass
+                    finally:
+                        setattr(spawn, attr, None)
 
         # Result file is the primary completion signal for hermes: the agent
         # writes its final response there, then exits 0.
@@ -905,16 +1082,34 @@ class AgentExecutor:
             ))
             return
 
-        # Timeout is the outer bound for a still-running lane.
+        # Timeout is the outer bound for a still-running lane. Kill the child so
+        # a timed-out hermes run doesn't keep burning quota as an orphan (F1).
         if rc is None and elapsed > self._config.spawn_timeout:
             logger.warning(
-                "hermes spawn timeout (%.0fs) for task %s",
-                self._config.spawn_timeout, task_id,
+                "hermes spawn timeout (%.0fs) for task %s — killing pid %s",
+                self._config.spawn_timeout, task_id, getattr(spawn.process, "pid", "?"),
             )
+            self._kill_spawn_process(spawn)
             resolved.append((
                 task_id, spawn, "timeout",
                 f"exceeded {self._config.spawn_timeout:.0f}s",
             ))
+
+    def _kill_spawn_process(self, spawn: ActiveSpawn) -> None:
+        """Best-effort terminate of a spawn's child process (tree on Windows)."""
+        proc = spawn.process
+        if proc is None or isinstance(proc, _ResumedProcess):
+            return  # nothing to kill (reconciled record holds no live handle)
+        try:
+            if os.name == "nt":
+                proc.kill()
+            else:
+                proc.terminate()
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
 
     def _capture_spawn_exits(self) -> None:
         """Check if any spawn processes have exited and capture diagnostics."""
@@ -925,18 +1120,84 @@ class AgentExecutor:
                 rc = spawn.process.poll()
                 if rc is not None:
                     spawn.spawn_exit_rc = rc
-                    if rc != 0:
+                    # Hermes stderr now lives in a per-spawn log file (F2), so
+                    # read it for diagnostics AND for the session_id line.
+                    if rc != 0 or spawn.mode == "hermes":
                         try:
-                            stderr_data = ""
-                            if spawn.process.stderr:
-                                stderr_data = spawn.process.stderr.read() or ""
-                            elif spawn.process.stdout:
-                                stderr_data = spawn.process.stdout.read() or ""
+                            stderr_data = self._read_spawn_stderr(spawn)
                             if stderr_data:
-                                lines = stderr_data.decode(errors="replace").strip().split("\n")
+                                lines = stderr_data.strip().split("\n")
                                 spawn.spawn_exit_stderr = "\n".join(lines[-5:])[:500]
                         except Exception:
                             pass
+
+    def _read_spawn_stderr(self, spawn: ActiveSpawn) -> str:
+        """Read a spawn's stderr: from the log file (hermes) or the PIPE."""
+        if getattr(spawn, "stderr_path", ""):
+            try:
+                return Path(spawn.stderr_path).read_text(
+                    encoding="utf-8", errors="replace"
+                )
+            except OSError:
+                return ""
+        try:
+            if spawn.process.stderr:
+                data = spawn.process.stderr.read() or b""
+            elif spawn.process.stdout:
+                data = spawn.process.stdout.read() or b""
+            else:
+                return ""
+            if isinstance(data, bytes):
+                return data.decode(errors="replace")
+            return str(data)
+        except Exception:
+            return ""
+
+    def _extract_session_id(self, stderr_text: str) -> str:
+        """Parse the ``session_id: <id>`` line hermes prints to stderr (cli.py:4063,4087).
+
+        Lines look like ``session_id: 20260910_120000_ab12cd`` or
+        ``session_id: <id>``; return the id or '' when absent. Best-effort,
+        never raises.
+        """
+        if not stderr_text:
+            return ""
+        for line in stderr_text.splitlines():
+            line = line.strip()
+            if line.startswith("session_id:"):
+                val = line.split(":", 1)[1].strip()
+                if val:
+                    return val
+        return ""
+
+    def _touch_lane_from_spawn(self, spawn: ActiveSpawn, task_id: str) -> None:
+        """Record a lane's session id + last task into the lanes table.
+
+        Called on reap for a hermes delivery: read the stderr log for hermes'
+        ``session_id`` line and persist it, so the next task with the same
+        lane_key resumes that session (``--resume <session_id>``).
+        """
+        if not spawn.lane_key or getattr(self, "_store", None) is None:
+            return
+        try:
+            stderr_text = self._read_spawn_stderr(spawn)
+            session_id = self._extract_session_id(stderr_text)
+            self._store.record_lane(
+                lane_key=spawn.lane_key,
+                session_id=session_id or spawn.session_id,
+                profile=self._config.hermes_profile,
+                role=spawn.role,
+                node=self._node_id,
+                last_task_id=task_id,
+            )
+            if session_id and session_id != spawn.session_id:
+                spawn.session_id = session_id
+                logger.info(
+                    "lane %s now bound to hermes session %s (task %s)",
+                    spawn.lane_key, session_id, task_id,
+                )
+        except Exception:
+            logger.exception("failed to record lane session for lane %s", spawn.lane_key)
 
     def _query_all_lane_statuses(self) -> Optional[Dict[str, str]]:
         """Run ``bdaya-dispatch status --json`` and return {lane_name: state}.

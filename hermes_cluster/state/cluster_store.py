@@ -9,6 +9,7 @@ Schema mirrors the in-memory ClusterState but persists to a single .db file.
 from __future__ import annotations
 
 import json
+import logging
 import secrets
 import sqlite3
 import threading
@@ -37,6 +38,8 @@ from ..models import (
     Task,
     TaskStatus,
 )
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -108,6 +111,19 @@ CREATE TABLE IF NOT EXISTS tasks (
     updated_at TEXT,
     version INTEGER DEFAULT 0,
     fail_reason TEXT
+);
+
+-- Stateful lanes: one row per lane_key, keyed to the hermes session it owns.
+-- A task whose lane_key has a live row RESUMES that hermes session instead of
+-- spawning a fresh one (shared/claude-plugins#847/#833; PR#16 stateful-lanes).
+CREATE TABLE IF NOT EXISTS lanes (
+    lane_key TEXT PRIMARY KEY,
+    session_id TEXT DEFAULT '',
+    profile TEXT DEFAULT '',
+    role TEXT DEFAULT 'author',
+    node TEXT DEFAULT '',
+    created_at REAL NOT NULL,
+    last_task_id TEXT DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS leases (
@@ -194,7 +210,10 @@ CREATE TABLE IF NOT EXISTS task_spawns (
     started_at REAL NOT NULL,
     lease_id TEXT DEFAULT '',
     lane_name TEXT DEFAULT '',
-    result_path TEXT DEFAULT ''
+    result_path TEXT DEFAULT '',
+    lane_key TEXT DEFAULT '',
+    role TEXT DEFAULT 'author',
+    session_id TEXT DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
@@ -266,7 +285,48 @@ class ClusterStore:
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.executescript(_SCHEMA_SQL)
+        self._migrate_schema()
         self._conn.commit()
+
+    def _migrate_schema(self) -> None:
+        """Best-effort ALTER TABLE migrations for schema drift on old DBs.
+
+        Old databases predate the stateful-lane columns (lane_key/role on
+        tasks) and the ``lanes`` table. Each migration is idempotent: the
+        column/table existence check makes re-runs no-ops, and failures are
+        logged rather than failing the whole store open.
+        """
+        for table, column, ddl in (
+            ("tasks", "lane_key", "ALTER TABLE tasks ADD COLUMN lane_key TEXT DEFAULT ''"),
+            ("tasks", "role", "ALTER TABLE tasks ADD COLUMN role TEXT DEFAULT 'author'"),
+            ("task_spawns", "lane_key", "ALTER TABLE task_spawns ADD COLUMN lane_key TEXT DEFAULT ''"),
+            ("task_spawns", "role", "ALTER TABLE task_spawns ADD COLUMN role TEXT DEFAULT 'author'"),
+            ("task_spawns", "session_id", "ALTER TABLE task_spawns ADD COLUMN session_id TEXT DEFAULT ''"),
+        ):
+            try:
+                cols = [r[1] for r in self._conn.execute(f"PRAGMA table_info({table})")]
+                if column not in cols:
+                    self._conn.execute(ddl)
+            except Exception as e:
+                logger.warning("schema migration skipped (%s.%s): %s", table, column, e)
+        try:
+            rows = self._conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='lanes'"
+            ).fetchall()
+            if not rows:
+                self._conn.execute(
+                    """CREATE TABLE IF NOT EXISTS lanes (
+                        lane_key TEXT PRIMARY KEY,
+                        session_id TEXT DEFAULT '',
+                        profile TEXT DEFAULT '',
+                        role TEXT DEFAULT 'author',
+                        node TEXT DEFAULT '',
+                        created_at REAL NOT NULL,
+                        last_task_id TEXT DEFAULT ''
+                    )"""
+                )
+        except Exception as e:
+            logger.warning("lanes table migration skipped: %s", e)
 
     @contextmanager
     def _tx(self):
@@ -389,16 +449,23 @@ class ClusterStore:
     # -------------------------------------------------------------------
 
     def create_task(
-        self, task_id: str, title: str, requires: List[str], priority: int = 3
+        self,
+        task_id: str,
+        title: str,
+        requires: List[str],
+        priority: int = 3,
+        lane_key: str = "",
+        role: str = "author",
     ) -> Task:
         now = datetime.utcnow()
         with self._tx() as conn:
             conn.execute(
                 """INSERT OR IGNORE INTO tasks
-                   (id, title, requires, depends_on, priority, status, created_at, updated_at, version)
-                   VALUES (?, ?, ?, '[]', ?, ?, ?, ?, 1)""",
+                   (id, title, requires, depends_on, priority, status, created_at, updated_at, version, lane_key, role)
+                   VALUES (?, ?, ?, '[]', ?, ?, ?, ?, 1, ?, ?)""",
                 (task_id, title, _json_dumps(requires), priority,
-                 TaskStatus.pending.value, _dt_to_str(now), _dt_to_str(now)),
+                 TaskStatus.pending.value, _dt_to_str(now), _dt_to_str(now),
+                 lane_key, role),
             )
         # Promote to ready immediately if no dependencies (matching ClusterState behavior)
         # The original in-memory store returns by reference so the caller
@@ -415,6 +482,7 @@ class ClusterStore:
         return self.get_task(task_id) or Task(
             id=task_id, title=title, requires=requires, priority=priority,
             status=TaskStatus.pending, created_at=now, updated_at=now, version=1,
+            lane_key=lane_key, role=role,
         )
 
     def get_task(self, task_id: str) -> Optional[Task]:
@@ -550,6 +618,14 @@ class ClusterStore:
         return counts
 
     def _row_to_task(self, row: sqlite3.Row) -> Task:
+        try:
+            lane_key = row["lane_key"]
+        except (KeyError, IndexError):
+            lane_key = ""
+        try:
+            role = row["role"]
+        except (KeyError, IndexError):
+            role = "author"
         return Task(
             id=row["id"],
             title=row["title"],
@@ -562,6 +638,8 @@ class ClusterStore:
             updated_at=_str_to_dt(row["updated_at"]),
             version=row["version"],
             fail_reason=row["fail_reason"],
+            lane_key=lane_key,
+            role=role,
         )
 
     # -------------------------------------------------------------------
@@ -1114,14 +1192,19 @@ class ClusterStore:
         lease_id: str = "",
         lane_name: str = "",
         result_path: str = "",
+        lane_key: str = "",
+        role: str = "author",
+        session_id: str = "",
     ) -> None:
         """Persist a task spawn record (upsert by task_id)."""
         with self._tx() as conn:
             conn.execute(
                 """INSERT OR REPLACE INTO task_spawns
-                   (task_id, mode, job_id, pid, started_at, lease_id, lane_name, result_path)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (task_id, mode, job_id, pid, started_at, lease_id, lane_name, result_path),
+                   (task_id, mode, job_id, pid, started_at, lease_id, lane_name,
+                    result_path, lane_key, role, session_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (task_id, mode, job_id, pid, started_at, lease_id, lane_name,
+                 result_path, lane_key, role, session_id),
             )
 
     def get_task_spawn(self, task_id: str) -> Optional[dict]:
@@ -1140,6 +1223,67 @@ class ClusterStore:
         with self._tx() as conn:
             result = conn.execute(
                 "DELETE FROM task_spawns WHERE task_id = ?", (task_id,)
+            )
+            return result.rowcount > 0
+
+    # -------------------------------------------------------------------
+    # Stateful lanes (lane_key -> hermes session map)
+    # -------------------------------------------------------------------
+
+    def record_lane(
+        self,
+        lane_key: str,
+        session_id: str = "",
+        profile: str = "",
+        role: str = "author",
+        node: str = "",
+        created_at: Optional[float] = None,
+        last_task_id: str = "",
+    ) -> None:
+        """Upsert a lane record by lane_key (first created_at always wins)."""
+        with self._tx() as conn:
+            row = conn.execute(
+                "SELECT created_at FROM lanes WHERE lane_key = ?", (lane_key,)
+            ).fetchone()
+            effective_created = (
+                row["created_at"]
+                if row
+                else (created_at if created_at is not None else time.time())
+            )
+            conn.execute(
+                """INSERT OR REPLACE INTO lanes
+                   (lane_key, session_id, profile, role, node, created_at, last_task_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (lane_key, session_id, profile, role, node,
+                 effective_created, last_task_id),
+            )
+
+    def get_lane(self, lane_key: str) -> Optional[dict]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM lanes WHERE lane_key = ?", (lane_key,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_all_lanes(self) -> List[dict]:
+        with self._lock:
+            rows = self._conn.execute("SELECT * FROM lanes").fetchall()
+        return [dict(r) for r in rows]
+
+    def touch_lane_last_task(self, lane_key: str, task_id: str) -> None:
+        """Update the last task delivered to a lane; no-op when lane absent."""
+        if not lane_key:
+            return
+        with self._tx() as conn:
+            conn.execute(
+                "UPDATE lanes SET last_task_id = ? WHERE lane_key = ?",
+                (task_id, lane_key),
+            )
+
+    def delete_lane(self, lane_key: str) -> bool:
+        with self._tx() as conn:
+            result = conn.execute(
+                "DELETE FROM lanes WHERE lane_key = ?", (lane_key,)
             )
             return result.rowcount > 0
 
