@@ -1,10 +1,12 @@
 """End-to-end test for the agent executor lifecycle.
 
-Uses a mock subprocess (echo command that exits 0) to prove the full loop:
-  submit task -> schedule/assign -> executor picks it up -> "spawn" completes -> task marked completed
+Uses a mock subprocess and mock lane-status polling to prove the full loop:
+  submit task -> schedule/assign -> executor picks it up -> lane status
+  reports "done" -> task marked completed
 
 This avoids needing a real bdaya-dispatch spawn (which would cost credits and require
-a live worker restart). The real spawn is validated by the unit tests mocking subprocess.Popen.
+a live worker restart). Completion is driven by lane-status polling, not subprocess
+exit codes (bdaya-dispatch run backgrounds the lane and exits 0 immediately).
 
 Run:
     pytest tests_v3/test_e2e_agent_executor.py -v

@@ -218,14 +218,16 @@ class TestAgentExecutorUnit:
 
         with patch.object(executor, "_query_all_lane_statuses",
                           return_value={"hermes-task_abc": "done"}):
-            with patch.object(executor, "_report_completion") as mock_complete:
-                executor._reap_finished_spawns()
-                mock_complete.assert_called_once_with("task_abc")
+            with patch.object(executor, "_capture_spawn_exits"):
+                with patch.object(executor, "_report_completion") as mock_complete:
+                    executor._reap_finished_spawns()
+                    mock_complete.assert_called_once()
+                    assert mock_complete.call_args[0][0] == "task_abc"
 
         assert "task_abc" not in executor._active_spawns
 
     def test_reap_finished_spawn_failure(self):
-        """A lane with state=blocked triggers failure report."""
+        """A lane with state=stopped triggers failure report."""
         cfg = AgentExecutorConfig(enabled=True)
         executor = AgentExecutor(
             config=cfg,
@@ -249,16 +251,17 @@ class TestAgentExecutorUnit:
         executor._active_spawns["task_def"] = spawn
 
         with patch.object(executor, "_query_all_lane_statuses",
-                          return_value={"hermes-task_def": "blocked"}):
-            with patch.object(executor, "_report_failure") as mock_fail:
-                executor._reap_finished_spawns()
-                mock_fail.assert_called_once()
-                call_args = mock_fail.call_args
-                assert call_args[0][0] == "task_def"
-                assert "blocked" in call_args[0][1]
+                          return_value={"hermes-task_def": "stopped"}):
+            with patch.object(executor, "_capture_spawn_exits"):
+                with patch.object(executor, "_report_failure") as mock_fail:
+                    executor._reap_finished_spawns()
+                    mock_fail.assert_called_once()
+                    call_args = mock_fail.call_args
+                    assert call_args[0][0] == "task_def"
+                    assert "stopped" in call_args[0][1]
 
     def test_reap_timeout_spawn(self):
-        """A spawn that exceeds timeout is reported as failed."""
+        """A spawn that exceeds timeout is reported as failed (for non-terminal lanes)."""
         cfg = AgentExecutorConfig(enabled=True, spawn_timeout=1.0)
         executor = AgentExecutor(
             config=cfg,
@@ -283,9 +286,10 @@ class TestAgentExecutorUnit:
 
         with patch.object(executor, "_query_all_lane_statuses",
                           return_value={"hermes-task_timeout": "working"}):
-            with patch.object(executor, "_report_failure") as mock_fail:
-                executor._reap_finished_spawns()
-                mock_fail.assert_called_once()
+            with patch.object(executor, "_capture_spawn_exits"):
+                with patch.object(executor, "_report_failure") as mock_fail:
+                    executor._reap_finished_spawns()
+                    mock_fail.assert_called_once()
 
     def test_claim_and_spawn_dedup_no_double_spawn(self):
         """A task already in _active_spawns is NOT re-spawned on re-poll (B2).
