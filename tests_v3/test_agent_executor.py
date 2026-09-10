@@ -193,7 +193,7 @@ class TestAgentExecutorUnit:
         assert status["spawns"] == []
 
     def test_reap_finished_spawn_success(self):
-        """A spawn that exits 0 triggers completion report."""
+        """A lane with state=done triggers completion report."""
         cfg = AgentExecutorConfig(enabled=True)
         executor = AgentExecutor(
             config=cfg,
@@ -201,10 +201,8 @@ class TestAgentExecutorUnit:
             cluster_endpoint="http://127.0.0.1:9999",
         )
 
-        # Mock a finished process (exit code 0)
         mock_proc = MagicMock()
-        mock_proc.poll.return_value = 0
-        mock_proc.stdout = None
+        mock_proc.poll.return_value = None  # process backgrounded
         mock_proc.pid = 12345
 
         from hermes_cluster.core.agent_executor import ActiveSpawn
@@ -218,16 +216,18 @@ class TestAgentExecutorUnit:
         )
         executor._active_spawns["task_abc"] = spawn
 
-        # Mock the report call
-        with patch.object(executor, "_report_completion") as mock_complete:
-            executor._reap_finished_spawns()
-            mock_complete.assert_called_once_with("task_abc")
+        with patch.object(executor, "_query_all_lane_statuses",
+                          return_value={"hermes-task_abc": "done"}):
+            with patch.object(executor, "_capture_spawn_exits"):
+                with patch.object(executor, "_report_completion") as mock_complete:
+                    executor._reap_finished_spawns()
+                    mock_complete.assert_called_once()
+                    assert mock_complete.call_args[0][0] == "task_abc"
 
-        # Spawn should be removed
         assert "task_abc" not in executor._active_spawns
 
     def test_reap_finished_spawn_failure(self):
-        """A spawn that exits non-zero triggers failure report."""
+        """A lane with state=stopped triggers failure report."""
         cfg = AgentExecutorConfig(enabled=True)
         executor = AgentExecutor(
             config=cfg,
@@ -236,8 +236,7 @@ class TestAgentExecutorUnit:
         )
 
         mock_proc = MagicMock()
-        mock_proc.poll.return_value = 1
-        mock_proc.stdout = None
+        mock_proc.poll.return_value = None
         mock_proc.pid = 12345
 
         from hermes_cluster.core.agent_executor import ActiveSpawn
@@ -251,15 +250,18 @@ class TestAgentExecutorUnit:
         )
         executor._active_spawns["task_def"] = spawn
 
-        with patch.object(executor, "_report_failure") as mock_fail:
-            executor._reap_finished_spawns()
-            mock_fail.assert_called_once()
-            call_args = mock_fail.call_args
-            assert call_args[0][0] == "task_def"
-            assert "exited with code 1" in call_args[0][1]
+        with patch.object(executor, "_query_all_lane_statuses",
+                          return_value={"hermes-task_def": "stopped"}):
+            with patch.object(executor, "_capture_spawn_exits"):
+                with patch.object(executor, "_report_failure") as mock_fail:
+                    executor._reap_finished_spawns()
+                    mock_fail.assert_called_once()
+                    call_args = mock_fail.call_args
+                    assert call_args[0][0] == "task_def"
+                    assert "stopped" in call_args[0][1]
 
     def test_reap_timeout_spawn(self):
-        """A spawn that exceeds timeout is killed and reported as failed."""
+        """A spawn that exceeds timeout is reported as failed (for non-terminal lanes)."""
         cfg = AgentExecutorConfig(enabled=True, spawn_timeout=1.0)
         executor = AgentExecutor(
             config=cfg,
@@ -268,9 +270,8 @@ class TestAgentExecutorUnit:
         )
 
         mock_proc = MagicMock()
-        mock_proc.poll.return_value = None  # still running
+        mock_proc.poll.return_value = None  # still backgrounded
         mock_proc.pid = 12345
-        mock_proc.kill = MagicMock()
 
         from hermes_cluster.core.agent_executor import ActiveSpawn
         spawn = ActiveSpawn(
@@ -283,10 +284,12 @@ class TestAgentExecutorUnit:
         )
         executor._active_spawns["task_timeout"] = spawn
 
-        with patch.object(executor, "_report_failure") as mock_fail:
-            executor._reap_finished_spawns()
-            mock_proc.kill.assert_called_once()
-            mock_fail.assert_called_once()
+        with patch.object(executor, "_query_all_lane_statuses",
+                          return_value={"hermes-task_timeout": "working"}):
+            with patch.object(executor, "_capture_spawn_exits"):
+                with patch.object(executor, "_report_failure") as mock_fail:
+                    executor._reap_finished_spawns()
+                    mock_fail.assert_called_once()
 
     def test_claim_and_spawn_dedup_no_double_spawn(self):
         """A task already in _active_spawns is NOT re-spawned on re-poll (B2).
