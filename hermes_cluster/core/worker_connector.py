@@ -105,6 +105,7 @@ def start_worker_connector(
     capabilities: List[str],
     peer_token: str = "",
     heartbeat_interval: float = 10.0,
+    max_concurrent: int = 0,
 ) -> None:
     """Start the outbound worker connector thread.
 
@@ -117,6 +118,9 @@ def start_worker_connector(
         peer_token: shared secret for signing (resolved from env/file if empty)
         heartbeat_interval: seconds between heartbeat POSTs. MUST be < main's
             watchdog degraded_after (default 15s). Default 10s gives safe margin.
+        max_concurrent: maximum simultaneously-assigned tasks this worker can
+            run; declared at /join so the main scheduler honours the ceiling
+            when assigning tasks (#833). 0 = unlimited.
     """
     global _connector_started
     with _connector_lock:
@@ -161,6 +165,7 @@ def start_worker_connector(
                     "node_name": node_id,
                     "capabilities": capabilities,
                     "endpoint": f"http://{node_id}:0",
+                    "max_concurrent": max_concurrent,
                 }
                 result = _signed_post(
                     cluster_endpoint, "/api/v1/nodes/join", join_data, token, node_id

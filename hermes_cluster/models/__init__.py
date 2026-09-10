@@ -104,6 +104,7 @@ class Node(BaseModel):
     status: NodeStatus = NodeStatus.online
     last_heartbeat: datetime = Field(default_factory=datetime.utcnow)
     load: float = 0.0  # 0.0 - 1.0
+    max_concurrent: int = 0  # max simultaneously-assigned tasks; 0 = unlimited
 
 
 # ===========================================================================
@@ -668,6 +669,7 @@ class JoinRequest(BaseModel):
     node_name: str
     capabilities: List[str] = []
     endpoint: str = ""
+    max_concurrent: int = 0  # 0 = unlimited; scheduler honours this ceiling
 
 
 class JoinResponse(BaseModel):

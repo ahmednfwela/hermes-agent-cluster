@@ -32,11 +32,17 @@ async def join(req: JoinRequest):
             node_id="node_" + req.node_name,
             name=req.node_name,
             capabilities=req.capabilities,
+            max_concurrent=req.max_concurrent,
         )
     else:
         # Fallback to direct state
         node_id = "node_" + req.node_name
-        node = Node(id=node_id, name=req.node_name, capabilities=req.capabilities)
+        node = Node(
+            id=node_id,
+            name=req.node_name,
+            capabilities=req.capabilities,
+            max_concurrent=req.max_concurrent,
+        )
         _state.register_node(node)
     return JoinResponse(node_id=node.id, status="registered")
 
