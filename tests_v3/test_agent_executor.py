@@ -127,7 +127,7 @@ class TestExecutorStatus:
             agent_executor_config={
                 "enabled": True,
                 "profile": "alibaba1",
-                "model": "qwen3.7-plus",
+                "model": "sonnet",
                 "poll_interval": 60,  # long interval so it doesn't poll during test
                 "max_concurrent": 1,
             },
@@ -138,7 +138,7 @@ class TestExecutorStatus:
             data = resp.json()
             assert data["enabled"] is True
             assert data["profile"] == "alibaba1"
-            assert data["model"] == "qwen3.7-plus"
+            assert data["model"] == "sonnet"
             assert data["active_spawns"] == 0
 
 
@@ -152,7 +152,7 @@ class TestAgentExecutorUnit:
         cfg = AgentExecutorConfig()
         assert cfg.enabled is False
         assert cfg.profile == "alibaba1"
-        assert cfg.model == "qwen3.7-plus"
+        assert cfg.model == "sonnet"
         assert cfg.poll_interval == 15.0
         assert cfg.max_concurrent == 1
         assert cfg.spawn_timeout == 1800.0
