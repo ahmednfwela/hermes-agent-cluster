@@ -1,0 +1,18 @@
+{
+  "catalog": "bdaya",
+  "version": 1,
+  "plugins": [
+    {
+      "name": "bdaya-enforcement",
+      "version": "0.1.0",
+      "path": "plugins/bdaya-enforcement",
+      "description": "Bdaya enforcement hooks: mandate merge gate, dispatch-dedup guard, proof-or-hedge verifier, mandate auto-arm banner."
+    }
+  ],
+  "packs": [
+    {
+      "name": "bdaya-full-pack",
+      "path": "packs/bdaya-full-pack.yaml"
+    }
+  ]
+}

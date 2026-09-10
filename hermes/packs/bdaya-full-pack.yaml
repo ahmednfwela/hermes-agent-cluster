@@ -1,0 +1,5 @@
+name: bdaya-full-pack
+version: 0.1.0
+description: "Full Bdaya enforcement pack -- all four hooks (mandate gate, dispatch-dedup, proof-or-hedge, auto-arm)."
+plugins:
+  - bdaya-enforcement

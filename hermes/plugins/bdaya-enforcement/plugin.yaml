@@ -1,0 +1,12 @@
+name: bdaya-enforcement
+version: 0.1.0
+description: >
+  Bdaya enforcement hooks ported from shared/claude-plugins/plugins/bdaya-defaults:
+  RV-1 mandate merge gate, dispatch dedup guard, proof-or-hedge verifier, and
+  mandate auto-arm banner. Pure Python predicates with deps-injected side effects.
+author: "bdaya"
+hooks:
+  - pre_tool_call
+  - pre_verify
+  - on_session_start
+pip_dependencies: []
