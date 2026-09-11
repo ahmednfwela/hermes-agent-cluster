@@ -696,7 +696,13 @@ class SubmitTaskRequest(BaseModel):
 
 
 class FailTaskRequest(BaseModel):
-    reason: str = "failed"
+    # #858: reason is REQUIRED (was defaulted to "failed"). A failure
+    # recorded without a real reason is indistinguishable from the
+    # busy-lane incident — failed task, error None, zero-byte result —
+    # i.e. a failure the operator cannot investigate. Callers that have
+    # nothing to say must say something ("no reason captured"), never
+    # nothing.
+    reason: str
 
 
 class CancelTaskRequest(BaseModel):
