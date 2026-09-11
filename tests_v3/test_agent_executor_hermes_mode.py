@@ -253,21 +253,33 @@ class TestHermesReap:
 
     def test_reconciled_spawn_completes_after_pid_gone(self, tmp_path):
         """End to end: a reconciled spawn whose pid is gone resolves done
-        once its result file has content (the restart-reconcile path)."""
+        once its result file has content (the restart-reconcile path).
+
+        The Windows dead-pid probe (os.name == 'nt') is patched ONLY around
+        the poll() call itself: patching it across _reap_hermes_spawn would
+        also flip pathlib.Path to WindowsPath, which cannot be constructed
+        on Linux CI runners. The _exited latch set during the patched probe
+        carries into the unpatched reap.
+        """
         from hermes_cluster.core.agent_executor import _ResumedProcess
 
         executor = _executor(spawn_timeout=3600)
         result_path = tmp_path / 'reconciled.md'
         result_path.write_text('the lane answer', encoding='utf-8')
         spawn = _hermes_spawn('t_reconciled', result_path=str(result_path))
-        spawn.process = _ResumedProcess(pid=999999)
+        proc = _ResumedProcess(pid=999999)
+        spawn.process = proc
         err = OSError(22, 'The parameter is incorrect')
         err.winerror = 87
 
-        resolved = []
+        # simulate the Windows probe: pid-gone => poll() latches exited
         with patch('hermes_cluster.core.agent_executor.os.kill', side_effect=err), \
              patch('hermes_cluster.core.agent_executor.os.name', 'nt'):
-            executor._reap_hermes_spawn('t_reconciled', spawn, 42.0, resolved)
+            assert proc.poll() == 0
+        assert proc._exited is True
+
+        resolved = []
+        executor._reap_hermes_spawn('t_reconciled', spawn, 42.0, resolved)
 
         assert resolved and resolved[0][2] == 'done'
 
