@@ -12,7 +12,11 @@ Two spawn modes (config ``agent_executor.worker``; default ``bdaya-dispatch``):
     (``hermes -p <profile> chat --query-file <brief> -Q``) that runs the task
     to completion, writes a result file, and exits non-zero on failure; this
     mode tracks the process (pid + exit code + result file) instead of lane
-    status.
+    status. The child's inherited STDOUT goes to ``<task>.stdout.log`` (a
+    transcript) and ``<task>.result.md`` is left FREE for the lane to write
+    its deliverable into — the executor never opens it (shared/claude-plugins
+    #868: holding the deliverable path open made Windows refuse the lane's
+    tmp-then-rename write and silently stranded whole verdicts).
 
 Restart safety (#804 note 132791): the task→lane map is persisted in the
 ClusterStore SQLite (``task_spawns`` table) and reconciled on start — a lane
@@ -113,8 +117,10 @@ class ActiveSpawn:
     started_at: float = 0.0
     lane_name: str = ""
     mode: str = "bdaya-dispatch"  # which worker mode spawned this (matches config.worker)
-    result_path: str = ""  # hermes mode: path of the result file the lane writes
-    result_file: Optional[object] = None  # open handle for the result file (hermes)
+    result_path: str = ""  # hermes mode: DELIVERABLE path the lane writes; the executor NEVER opens it (#868)
+    result_file: Optional[object] = None  # DEPRECATED (#868): old handle field, kept for reconciled records
+    stdout_path: str = ""  # hermes mode: path of the child's inherited stdout (transcript, #868)
+    stdout_file: Optional[object] = None  # open handle for the stdout log (hermes)
     stderr_path: str = ""  # hermes mode: path of the child's stderr log
     stderr_file: Optional[object] = None  # open handle for the stderr log (hermes)
     resumed: bool = False  # True when reconstructed from the persisted spawn map
@@ -341,6 +347,7 @@ class AgentExecutor:
                     "pid": spawn.process.pid,
                     "poll_alive": spawn.process.poll() is None,
                     "result_path": spawn.result_path,
+                    "stdout_path": getattr(spawn, "stdout_path", ""),
                 })
             return {
                 "running": self._running,
@@ -609,6 +616,71 @@ class AgentExecutor:
         d.mkdir(parents=True, exist_ok=True)
         return d / f"{task_id}.result.md"
 
+    def _hermes_stdout_path(self, task_id: str) -> Path:
+        """Transcript file for a native hermes lane's child STDOUT (#868).
+
+        This — NOT the result file — is the path the executor opens and keeps
+        for the child's lifetime so stdout inheritance works. Before #868 the
+        same handle served ``<task>.result.md``: on Windows the parent's open
+        handle made the lane's own tmp-then-rename write to that path fail
+        with a sharing violation, so whole deliverables (a NEEDS-CHANGES
+        verdict in the incident that prompted this) stranded as
+        ``.hermes-tmp.*`` while a truncated stdout copy read as a pass.
+        Transcript and deliverable are genuinely different things; each now
+        has its own path.
+        """
+        d = Path(self._config.working_dir or ".") / "hermes-results"
+        d.mkdir(parents=True, exist_ok=True)
+        return d / f"{task_id}.stdout.log"
+
+    @staticmethod
+    def _remove_quiet(path: Path) -> None:
+        """Delete a file if present; never raise. Used for spawn-time cleanup
+        of a previous delivery's files — a file another (live) process holds
+        open cannot be deleted on Windows and is left alone."""
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+    @staticmethod
+    def _open_stdout_log(path: Path):
+        """Open the child's inherited-stdout transcript log (#868).
+
+        Fresh spawn: truncate. A file that survives the spawn-time cleanup
+        below is held open by a still-live (crashed-child) writer, in which
+        case truncating would destroy its transcript and 'a' at least keeps
+        the delivery's own bytes appended instead of failing mid-spawn.
+        """
+        if path.exists():
+            return open(path, "a", encoding="utf-8")
+        return open(path, "w", encoding="utf-8")
+
+    @staticmethod
+    def _stranded_tmps(results_dir: Path, since: float) -> List[Path]:
+        """.hermes-tmp.* files in the results dir modified at/after ``since``.
+
+        A lane's deliverable write stages a ``.hermes-tmp.XXXXXX`` and renames
+        it over the target; on Windows the rename fails against an open file,
+        so the tmp is all that survives (shared/claude-plugins#868). Modified
+        within the window of the delivery that just finished — a stale temp
+        from a previous run is not evidence about THIS task, and the file is
+        surfaced (never deleted) either way.
+        """
+        out: List[Path] = []
+        try:
+            entries = list(results_dir.glob(".hermes-tmp.*"))
+        except OSError:
+            return out
+        for entry in entries:
+            try:
+                if entry.is_file() and entry.stat().st_mtime >= since:
+                    out.append(entry)
+            except OSError:
+                continue
+        return out
+
+
     def _hermes_stderr_path(self, task_id: str) -> Path:
         """Directory/log file where a native hermes lane's stderr is captured.
 
@@ -672,7 +744,22 @@ class AgentExecutor:
             lane_key=lane_key, role=role,
         )
         result_path = self._hermes_result_path(task_id)
+        stdout_path = self._hermes_stdout_path(task_id)
         stderr_path = self._hermes_stderr_path(task_id)
+
+        # Spawn-time cleanup of a PREVIOUS delivery's files (#868): the result
+        # check below is content-based, so a stale result.md from an earlier
+        # run of this task id must not mark a live lane done (#851 semantics —
+        # previously the open(result_path, "w") truncate provided it). If a
+        # crashed child still holds its stdout/stderr logs open we cannot
+        # delete them (Windows sharing violation); opening in append mode
+        # below then protects the orphan's transcript from truncation, and a
+        # fresh result.md is still removed so the new deliverable has a free
+        # path.
+        self._remove_quiet(result_path)
+        self._remove_quiet(stdout_path)
+        self._remove_quiet(stderr_path)
+
 
         # Stateful lane resolution: resume an existing live lane's session,
         # else this is the lane's first delivery (fresh titled session).
@@ -707,19 +794,23 @@ class AgentExecutor:
             task_id, " ".join(cmd),
         )
 
-        # Hold the result + stderr files open for the child's lifetime (closing
-        # the parent handle too early breaks stdout inheritance on Windows).
-        result_file = None
+        # Hold the STDOUT + stderr transcript files open for the child's
+        # lifetime (closing the parent handle too early breaks stdout
+        # inheritance on Windows). The DELIVERABLE path (result.md) is never
+        # opened here — #868: holding it open is what made the lane's own
+        # tmp-then-rename write fail on Windows and silently stranded whole
+        # deliverables.
+        stdout_file = None
         stderr_file = None
         try:
-            result_file = open(result_path, "w", encoding="utf-8")
+            stdout_file = self._open_stdout_log(stdout_path)
             stderr_file = open(stderr_path, "w", encoding="utf-8")
             proc = subprocess.Popen(
                 cmd,
                 cwd=self._config.working_dir,
-                # Agent final response (stdout) lands in the result file;
+                # Agent final response (stdout) lands in the transcript log;
                 # stderr (incl. the session_id line) goes to its own log file.
-                stdout=result_file,
+                stdout=stdout_file,
                 stderr=stderr_file,
                 # On Windows, create a new process group so we can kill the tree
                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP
@@ -727,7 +818,7 @@ class AgentExecutor:
                 else 0,
             )
         except FileNotFoundError:
-            for f in (result_file, stderr_file):
+            for f in (stdout_file, stderr_file):
                 if f is not None:
                     try:
                         f.close()
@@ -741,7 +832,7 @@ class AgentExecutor:
             self._report_failure(task_id, "executor_error: hermes not found on PATH")
             return
         except Exception as e:
-            for f in (result_file, stderr_file):
+            for f in (stdout_file, stderr_file):
                 if f is not None:
                     try:
                         f.close()
@@ -762,7 +853,8 @@ class AgentExecutor:
             lane_name=lane_name,
             mode="hermes",
             result_path=str(result_path),
-            result_file=result_file,
+            stdout_path=str(stdout_path),
+            stdout_file=stdout_file,
             stderr_path=str(stderr_path),
             stderr_file=stderr_file,
             lane_key=lane_key,
@@ -776,8 +868,8 @@ class AgentExecutor:
         self._persist_spawn(spawn)
 
         logger.info(
-            "spawned native hermes worker: task=%s pid=%d result=%s",
-            task_id, proc.pid, result_path,
+            "spawned native hermes worker: task=%s pid=%d result=%s stdout=%s",
+            task_id, proc.pid, result_path, stdout_path,
         )
 
     # -------------------------------------------------------------------
@@ -875,6 +967,11 @@ class AgentExecutor:
                     lane_name=record.get("lane_name") or f"hermes-{task_id}",
                     mode=record.get("mode") or "bdaya-dispatch",
                     result_path=record.get("result_path") or "",
+                    stdout_path=(
+                        str(self._hermes_stdout_path(task_id))
+                        if record.get("mode") == "hermes"
+                        else ""
+                    ),
                     stderr_path=(
                         record.get("stderr_path")
                         or str(self._hermes_stderr_path(task_id))
@@ -1072,10 +1169,11 @@ class AgentExecutor:
         """
         rc = spawn.process.poll()
 
-        # A resolved hermes spawn releases its result/stderr handles (the child
-        # has exited by then, so the close only releases the parent's copies).
+        # A resolved hermes spawn releases its stdout/stderr transcript
+        # handles (the child has exited by then, so the close only releases
+        # the parent's copies). The DELIVERABLE is never a held handle (#868).
         if rc is not None:
-            for attr in ("result_file", "stderr_file"):
+            for attr in ("stdout_file", "result_file", "stderr_file"):
                 fh = getattr(spawn, attr, None)
                 if fh is not None:
                     try:
@@ -1086,14 +1184,36 @@ class AgentExecutor:
                     finally:
                         setattr(spawn, attr, None)
 
-        # Result file is the primary completion signal for hermes: the agent
-        # writes its final response there, then exits 0. The file is the
-        # child's STDOUT, so content alone proves nothing while the process is
-        # alive — startup warnings (e.g. "Warning: Unknown toolsets: …") land
-        # there within seconds and used to mark a live lane done, freeing its
-        # lane slot while the agent kept running (shared/claude-plugins#851).
-        # A lane is done only once it has EXITED cleanly with content.
+        # The DELIVERABLE (result.md) is the primary completion signal for
+        # hermes (#868): the agent writes its final response there with its
+        # own write_file, then exits 0. Content still proves nothing while the
+        # process is alive — the lane may be mid-write, and #851's lesson
+        # (never resolve a LIVE lane as done on file content alone) carries
+        # over: a lane is done only once it has EXITED cleanly with content.
         result_ok = bool(spawn.result_path) and Path(spawn.result_path).is_file()
+        # Reap-time lost-deliverable check (#868): a .hermes-tmp.* in the
+        # results dir written within THIS delivery's window is a deliverable
+        # whose rename never landed — silent loss is the whole bug, so it is
+        # surfaced loudly (and never swept up) ahead of any 'done'.
+        stranded = []
+        if rc is not None:
+            results_dir = (
+                Path(spawn.result_path).parent if spawn.result_path
+                else Path(self._config.working_dir or ".") / "hermes-results"
+            )
+            stranded = self._stranded_tmps(results_dir, spawn.started_at)
+
+        if rc == 0 and stranded:
+            names = ", ".join(str(p) for p in stranded)
+            resolved.append((
+                task_id, spawn, "lost_deliverable",
+                f"hermes exited rc=0 but {len(stranded)} stranded "
+                f".hermes-tmp.* file(s) from this delivery were never renamed "
+                f"into place (lost deliverable — shared/claude-plugins#868): "
+                f"{names}",
+            ))
+            return
+
         if rc == 0 and result_ok:
             try:
                 contents = Path(spawn.result_path).read_text(
@@ -1116,7 +1236,30 @@ class AgentExecutor:
             return
 
         if rc is not None and rc == 0:
-            # Exited cleanly but produced no result file/content.
+            # Exited cleanly with no deliverable. When a non-empty transcript
+            # exists this must NOT be promoted to result.md (#868's !23 trap:
+            # stdout's per-section "Verdict: CORRECT" lines read as a pass
+            # while the real NEEDS-CHANGES verdict stranded elsewhere) —
+            # surface it as a lost deliverable pointing at the transcript.
+            has_transcript = False
+            if getattr(spawn, "stdout_path", ""):
+                try:
+                    has_transcript = (
+                        Path(spawn.stdout_path).is_file()
+                        and bool(Path(spawn.stdout_path).read_text(
+                            encoding="utf-8", errors="replace").strip())
+                    )
+                except OSError:
+                    has_transcript = False
+            if has_transcript:
+                resolved.append((
+                    task_id, spawn, "lost_deliverable",
+                    f"hermes exited rc=0 after {elapsed:.0f}s but wrote no "
+                    f"deliverable at {spawn.result_path}; transcript present "
+                    f"at {spawn.stdout_path} — do NOT treat it as the verdict "
+                    f"(shared/claude-plugins#868)",
+                ))
+                return
             resolved.append((
                 task_id, spawn, "no_result",
                 f"hermes exited rc=0 after {elapsed:.0f}s but wrote no result",
