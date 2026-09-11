@@ -67,6 +67,15 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
 # cluster-id/node-id/config are supplied by the Kubernetes Deployment args so
 # one image serves any main-node config. Static dashboard ships in the wheel
 # tree at /app/hermes_cluster/static.
+#
+# IMAGE CONTRACT (F1, reviewer infra PR#261): this image deliberately sets
+# CMD only and NO ENTRYPOINT — `docker run <image>` and the desktop behave
+# identically. Consequence for orchestrators: Kubernetes REPLACES CMD with
+# container.args (it does not append when command is unset), so any Pod spec
+# overriding args MUST also set `command: ["python"]` — as
+# infra-github cluster-config/hermes-main/deployment.yaml now does. Consumers
+# that prepend their own program (e.g. `docker run --entrypoint python <img>
+# -m hermes_cluster.serve --help`) are the proven-safe form.
 CMD ["python", "-m", "hermes_cluster.serve", \
      "--node-role", "main", \
      "--host", "0.0.0.0", \
