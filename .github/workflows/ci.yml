@@ -36,4 +36,7 @@ jobs:
         run: |
           python -m pip install -e ".[dev,postgres]" pyyaml
       - name: Test
-        run: python -m pytest tests_v3 -q
+        # -rs surfaces skip reasons: the postgres-leg tests skipping here
+        # (service down / DSN unset) must be visible in the job log, never
+        # silently absorbed into "passed" (#829 round-2 review).
+        run: python -m pytest tests_v3 -q -rs

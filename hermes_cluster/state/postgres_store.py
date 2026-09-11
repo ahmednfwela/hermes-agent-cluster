@@ -26,7 +26,10 @@ Isolation & the places SQLite's single-writer lock was load-bearing:
     relied on its process RLock to make a read-then-write sequence atomic,
     the port uses EITHER a single atomic statement (upserts, guarded
     UPDATEs — e.g. ``create_task``'s status-guarded promotion,
-    ``unassign_task``'s terminal+live-lease predicate) OR the explicit
+    ``unassign_task``'s terminal+live-lease predicate, ``update_capabilities``'
+    locked-CTE ``UPDATE ... RETURNING``, which also preserves the
+    capability-change callback's old-caps argument without a separate read)
+    OR the explicit
     transaction helper ``_txn`` for multi-statement sequences that must see
     their own writes (``record_decision``/``add_delivery`` insert+trim,
     ``handle_sync_message`` gate+append+apply — Postgres gives data-modifying
@@ -470,24 +473,58 @@ class PostgresClusterStore:
         )
 
     async def update_capabilities(self, node_id: str, caps: List[str]) -> None:
-        # Read the previous value first, then write (SQLite did the same under
-        # its lock). A concurrent writer could change old_caps between the two
-        # statements; capability-change callbacks are advisory, so — like the
-        # SQLite store's own two-step shape — we mirror its semantics rather
-        # than adding a transaction per heartbeat-scale update.
-        row = await self._row(
-            "SELECT capabilities FROM nodes WHERE id = $1", node_id,
-        )
-        old_caps = _json_loads(row["capabilities"]) if row else []
-        await self._fetch(
-            "UPDATE nodes SET capabilities = $1 WHERE id = $2",
+        # ONE atomic statement (round-2 review of 1043352). The previous
+        # SELECT-then-UPDATE lost concurrent updates: A read ["tooling"],
+        # B read ["tooling"], A wrote [...,"planning"], B wrote
+        # [...,"reviewing"] — "planning" gone, and the scheduler strands
+        # work on a node whose stored capabilities no longer match its
+        # declared ones. SQLite was safe only via its process RLock;
+        # cross-node Postgres does not serialise two statements.
+        #
+        # Shape chosen: UPDATE ... RETURNING with the predecessor read from
+        # a locked (FOR UPDATE) CTE, diff computed from the RETURNED row.
+        # Why this over the other two shapes the reviewer offered:
+        #   * Dropping the old-caps callback is NOT an option — cluster_core
+        #     wires _on_capability_change to trigger_pending+schedule and
+        #     the parity suite asserts the exact (node, old, new) args on
+        #     BOTH backends, so behaviour must be kept.
+        #   * An advisory lock would serialise MORE than needed (all nodes'
+        #     updates behind one global key) to protect what a plain row
+        #     lock already covers: the CTE's FOR UPDATE takes the row lock,
+        #     so racing writers queue per-row, and at READ COMMITTED the
+        #     blocked statement re-reads the LATEST committed row — the
+        #     returned old_caps is the true predecessor, never a stale
+        #     snapshot (verified empirically: session B's old_caps equals
+        #     session A's committed new_caps — regression test:
+        #     tests_v3/test_store_caps_race_pg.py).
+        # Unknown node: the UPDATE matches nothing, RETURNING yields no row,
+        # and no callback fires. The SQLite store fires with old=[] for any
+        # node_id, but every in-app caller (node_manager) checks existence
+        # first, so this divergence is unreachable; the parity test only
+        # exercises existing nodes.
+        row = await self.pool.fetchrow(
+            """WITH prev AS (
+                   SELECT capabilities AS old_caps FROM nodes
+                   WHERE id = $2
+                   FOR UPDATE
+               )
+               UPDATE nodes SET capabilities = $1
+               FROM prev
+               WHERE nodes.id = $2
+               RETURNING prev.old_caps AS old_caps,
+                         nodes.capabilities AS new_caps""",
             _json_dumps(caps), node_id,
         )
-        if self._on_capability_change:
-            try:
-                self._on_capability_change(node_id, old_caps, caps)
-            except Exception:
-                pass
+        if row is None or not self._on_capability_change:
+            return
+        old_caps = _json_loads(row["old_caps"])
+        # Fire unconditionally on a successful write, exactly like the
+        # SQLite store (which does not diff-gate), with the true
+        # predecessor and the stored successor.
+        try:
+            self._on_capability_change(node_id, old_caps, caps)
+        except Exception:
+            pass
 
     async def update_max_concurrent(self, node_id: str, max_concurrent: int) -> None:
         await self._fetch(
@@ -1048,12 +1085,26 @@ class PostgresClusterStore:
                         if node is None:
                             continue
 
-                        await conn.execute(
+                        # Status-guarded write (round-2 audit): the snapshot
+                        # above and this UPDATE sit under the schedule
+                        # advisory lock, but a DIFFERENT writer path — a
+                        # cancel or terminal set_task_status on another node
+                        # — does not take that lock, so without the guard a
+                        # task cancelled between snapshot and UPDATE would be
+                        # resurrected to running here. SQLite could not hit
+                        # this (one process RLock serialised schedule and
+                        # cancel); Postgres multi-node can. A guard miss
+                        # makes this writer a no-op — exactly the shape used
+                        # by create_task/trigger_pending.
+                        status = await conn.execute(
                             """UPDATE tasks SET status = $1, assigned_to = $2,
                                updated_at = $3, version = version + 1
-                               WHERE id = $4""",
+                               WHERE id = $4 AND status = $5""",
                             TaskStatus.running.value, node.id, now, task.id,
+                            TaskStatus.ready.value,
                         )
+                        if status == "UPDATE 0":
+                            continue
                         active_counts[node.id] = active_counts.get(node.id, 0) + 1
                         self._fair_scheduler.mark_picked(node.id)
 

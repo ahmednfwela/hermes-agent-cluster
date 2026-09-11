@@ -38,12 +38,28 @@ def _pg_available(dsn: str) -> bool:
 
 @pytest.fixture(scope="session")
 def pg_dsn() -> str:
-    """DSN for the throwaway test database, or skip the whole test."""
+    """DSN for the throwaway test database, or skip the whole test.
+
+    CI-hardening (round-2 review): if HERMES_CLUSTER_PG_TEST_DSN IS set,
+    the environment claims a server exists — an unreachable one is then a
+    CI misconfiguration (dead service container, wrong port), not a
+    "postgres unavailable locally" case, so FAIL loudly instead of
+    skipping. A silently-skipping pg suite is worse than no suite: it
+    would mark the Postgres leg green while never running it. Without the
+    env var (local sqlite-only dev), skipping stays the correct behaviour.
+    """
     dsn = os.environ.get("HERMES_CLUSTER_PG_TEST_DSN", "")
-    if not dsn or not _pg_available(dsn):
+    if not dsn:
         pytest.skip(
             "Postgres unavailable (set HERMES_CLUSTER_PG_TEST_DSN; "
             "CI provides a postgres:16 service — see module docstring)"
+        )
+    if not _pg_available(dsn):
+        pytest.fail(
+            "HERMES_CLUSTER_PG_TEST_DSN is set but no server answers — "
+            "the Postgres test leg would silently no-op. Check the CI "
+            "service container (ci.yml: postgres:16, health-checked) "
+            "or unset the variable for a sqlite-only local run."
         )
     return dsn
 
