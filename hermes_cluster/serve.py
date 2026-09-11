@@ -47,6 +47,22 @@ def main():
                 args.agent_executor_config = cfg["agent_executor"]
             if "store" in cfg and not args.db_path:
                 args.db_path = cfg["store"].get("db_path", "") or ""
+            # #829: store.backend selects the ClusterStore implementation.
+            # store.dsn_env names the env var holding the (secret) DSN —
+            # a literal DSN in the config file is rejected unconditionally.
+            args.store_backend = ""
+            args.store_dsn_env = "HERMES_CLUSTER_PG_DSN"
+            if "store" in cfg:
+                _store_cfg = cfg["store"] or {}
+                args.store_backend = str(_store_cfg.get("backend", "") or "")
+                if _store_cfg.get("dsn"):
+                    raise SystemExit(
+                        "config error: store.dsn is not supported — a literal "
+                        "DSN embeds the DB password in the repo/config. "
+                        "Put it in an env var and point store.dsn_env at it."
+                    )
+                if _store_cfg.get("dsn_env"):
+                    args.store_dsn_env = str(_store_cfg["dsn_env"])
         except ImportError:
             print("Warning: PyYAML not installed, ignoring config file", file=sys.stderr)
         except Exception as e:
@@ -74,6 +90,8 @@ def main():
         agent_executor_config=getattr(args, "agent_executor_config", None),
         static_dir=static_dir if static_dir else None,
         db_path=getattr(args, "db_path", "") or "",
+        store_backend=getattr(args, "store_backend", "") or "",
+        store_dsn_env=getattr(args, "store_dsn_env", "") or "HERMES_CLUSTER_PG_DSN",
     )
 
     print(f"Starting hermes-cluster (Python) on {args.host}:{args.port}")
