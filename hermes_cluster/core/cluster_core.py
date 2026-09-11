@@ -240,6 +240,8 @@ class ClusterCore:
         capabilities: Optional[List[str]] = None,
         db_path: str = ":memory:",
         config_path: str = "",
+        store_backend: str = "",
+        store_dsn_env: str = "HERMES_CLUSTER_PG_DSN",
         max_concurrent: int = 0,
         # Watchdog timing
         watchdog_check_interval: float = 5.0,
@@ -259,15 +261,23 @@ class ClusterCore:
         self.started_at = datetime.utcnow()
 
         # --- Initialize state ---
-        # Try to import ClusterStore (SQLite) first, fall back to ClusterState
-        try:
-            from ..state.cluster_store import ClusterStore
-            self.store = ClusterStore(db_path=db_path)
-            logger.info("initialized ClusterStore with db_path=%s", db_path)
-        except ImportError:
-            from ..state import ClusterState
-            self.store = ClusterState()
-            logger.info("initialized in-memory ClusterState")
+        # #829: route through the backend factory so store.backend=postgres
+        # works everywhere a store is constructed; SQLite stays the default
+        # for local/dev; fall back to in-memory ClusterState only on import
+        # failure of the SQLite module itself.
+        from ..state.factory import create_store as _create_store
+        if store_backend and store_backend.lower() not in ("sqlite", ""):
+            self.store = _create_store(backend=store_backend, dsn_env=store_dsn_env)
+            logger.info("initialized PostgresClusterStore (backend=%s)", store_backend)
+        else:
+            try:
+                from ..state.cluster_store import ClusterStore
+                self.store = ClusterStore(db_path=db_path)
+                logger.info("initialized ClusterStore with db_path=%s", db_path)
+            except ImportError:
+                from ..state import ClusterState
+                self.store = ClusterState()
+                logger.info("initialized in-memory ClusterState")
 
         self.store.cluster_id = cluster_id
         self.store.node_id = node_id
@@ -322,6 +332,10 @@ class ClusterCore:
                             "UPDATE nodes SET status = ? WHERE id = ?",
                             (status, node_id),
                         )
+                else:
+                    # PostgresClusterStore (sync facade) and anything else:
+                    # the public API is the ported surface (#829).
+                    self._store.set_node_status(node_id, NodeStatus(status))
 
         self._watchdog_adapter = _WatchdogAdapter(self.store)
 
