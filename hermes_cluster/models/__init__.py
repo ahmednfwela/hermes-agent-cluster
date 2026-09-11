@@ -111,13 +111,18 @@ class Node(BaseModel):
 # 3. Task (internal/scheduler/taskstore.go)
 # ===========================================================================
 
+# Documented default band when a submitter says nothing (#866): the sort is
+# ascending (ORDER BY priority, created_at), bands run 0 (top) .. 5.
+DEFAULT_PRIORITY = 3
+
+
 class Task(BaseModel):
     """Go struct: scheduler.Task"""
     id: str
     title: str
     requires: List[str] = []
     depends_on: List[str] = Field(default_factory=list, alias="depends_on")
-    priority: int = 3  # 1=highest, 5=lowest, default 3
+    priority: int = DEFAULT_PRIORITY  # 0=top band, 1..5 documented, default 3
     status: TaskStatus = TaskStatus.pending
     assigned_to: Optional[str] = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
@@ -690,7 +695,14 @@ class UpdateCapabilitiesRequest(BaseModel):
 class SubmitTaskRequest(BaseModel):
     title: str
     requires: List[str] = []
-    priority: int = 0  # 1=highest, 5=lowest, default 3
+    # Bands for the ascending scheduler sort (ORDER BY priority, created_at):
+    # 0=top band (most urgent), 1..5 documented bands, unset -> default 3.
+    # None is the not-supplied sentinel (#866): 0 used to double as it, so a
+    # caller sending 0 "to mean what the sort says" was silently rewritten
+    # to 3 — two bands in the wrong direction. Out-of-band values are
+    # rejected with a 422 here rather than coerced in the router: a loud
+    # failure beats a silent substitution.
+    priority: Optional[int] = Field(default=None, ge=0, le=5)
     lane_key: str = ""  # stateful lane identity (e.g. "shared/claude-plugins#feat/x")
     role: str = "author"  # "author" | "reviewer"
 

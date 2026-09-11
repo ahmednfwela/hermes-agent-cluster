@@ -3,6 +3,7 @@
 from fastapi import APIRouter, HTTPException, Request
 
 from ..models import (
+    DEFAULT_PRIORITY,
     SubmitTaskRequest,
     FailTaskRequest,
     CancelTaskRequest,
@@ -33,7 +34,10 @@ def _generate_task_id() -> str:
 @router.post("")
 async def submit_task(req: SubmitTaskRequest):
     task_id = _generate_task_id()
-    priority = req.priority if req.priority > 0 else 3
+    # Default only when the caller said nothing (None). 0 is a legal band —
+    # the top one — and must survive to the store untouched (#866). Range
+    # 0..5 is validated by SubmitTaskRequest, so out-of-band is already 422.
+    priority = DEFAULT_PRIORITY if req.priority is None else req.priority
     task = _state.create_task(
         task_id,
         req.title,
