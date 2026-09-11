@@ -66,6 +66,8 @@ def create_app(
     agent_executor_config: Optional[dict] = None,
     static_dir: Optional[str] = None,
     db_path: str = "",
+    store_backend: str = "",
+    store_dsn_env: str = "HERMES_CLUSTER_PG_DSN",
 ) -> FastAPI:
     """Create and configure the FastAPI application.
 
@@ -129,10 +131,15 @@ def create_app(
         allow_headers=["*"],
     )
 
-    # Initialize state: SQLite-backed ClusterStore when a db_path is configured
-    # (survives restarts — an in-memory main loses every task on restart), else
-    # the in-memory ClusterState. Both expose the same API.
-    if db_path:
+    # Initialize state via the backend factory (#829):
+    #   store.backend=postgres -> asyncpg-backed PostgresClusterStore (sync facade)
+    #   store.db_path          -> SQLite ClusterStore (default, local/dev)
+    #   neither                -> in-memory ClusterState.
+    # All three expose the same public API.
+    if store_backend and store_backend.lower() not in ("sqlite", ""):
+        from .state.factory import create_store
+        state = create_store(backend=store_backend, dsn_env=store_dsn_env)
+    elif db_path:
         from .state.cluster_store import ClusterStore
         state = ClusterStore(db_path=db_path)
         logger.info("cluster state: SQLite store at %s", db_path)

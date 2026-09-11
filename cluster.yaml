@@ -40,3 +40,12 @@ federation:
   enabled: true
   ping_interval: 30s
   token: ""
+
+# Cluster state store (#829). Default: SQLite at store.db_path (local/dev).
+# For the shared Postgres store, set backend: postgres and provide the DSN
+# via the environment (NEVER in this file):
+#   store:
+#     backend: postgres
+#     dsn_env: HERMES_CLUSTER_PG_DSN   # env var holding the asyncpg DSN
+# One-shot migration from an existing SQLite cluster.db:
+#   python -m hermes_cluster.tools.import_sqlite --db path/to/cluster.db
