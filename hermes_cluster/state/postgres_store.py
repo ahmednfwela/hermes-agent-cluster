@@ -473,58 +473,21 @@ class PostgresClusterStore:
         )
 
     async def update_capabilities(self, node_id: str, caps: List[str]) -> None:
-        # ONE atomic statement (round-2 review of 1043352). The previous
-        # SELECT-then-UPDATE lost concurrent updates: A read ["tooling"],
-        # B read ["tooling"], A wrote [...,"planning"], B wrote
-        # [...,"reviewing"] — "planning" gone, and the scheduler strands
-        # work on a node whose stored capabilities no longer match its
-        # declared ones. SQLite was safe only via its process RLock;
-        # cross-node Postgres does not serialise two statements.
-        #
-        # Shape chosen: UPDATE ... RETURNING with the predecessor read from
-        # a locked (FOR UPDATE) CTE, diff computed from the RETURNED row.
-        # Why this over the other two shapes the reviewer offered:
-        #   * Dropping the old-caps callback is NOT an option — cluster_core
-        #     wires _on_capability_change to trigger_pending+schedule and
-        #     the parity suite asserts the exact (node, old, new) args on
-        #     BOTH backends, so behaviour must be kept.
-        #   * An advisory lock would serialise MORE than needed (all nodes'
-        #     updates behind one global key) to protect what a plain row
-        #     lock already covers: the CTE's FOR UPDATE takes the row lock,
-        #     so racing writers queue per-row, and at READ COMMITTED the
-        #     blocked statement re-reads the LATEST committed row — the
-        #     returned old_caps is the true predecessor, never a stale
-        #     snapshot (verified empirically: session B's old_caps equals
-        #     session A's committed new_caps — regression test:
-        #     tests_v3/test_store_caps_race_pg.py).
-        # Unknown node: the UPDATE matches nothing, RETURNING yields no row,
-        # and no callback fires. The SQLite store fires with old=[] for any
-        # node_id, but every in-app caller (node_manager) checks existence
-        # first, so this divergence is unreachable; the parity test only
-        # exercises existing nodes.
-        row = await self.pool.fetchrow(
-            """WITH prev AS (
-                   SELECT capabilities AS old_caps FROM nodes
-                   WHERE id = $2
-                   FOR UPDATE
-               )
-               UPDATE nodes SET capabilities = $1
-               FROM prev
-               WHERE nodes.id = $2
-               RETURNING prev.old_caps AS old_caps,
-                         nodes.capabilities AS new_caps""",
+        # MUTATION (verify/829-mutation-caps-race): pre-fix read-then-write
+        # shape restored on purpose, to prove the regression test goes RED.
+        row = await self._row(
+            "SELECT capabilities FROM nodes WHERE id = $1", node_id,
+        )
+        old_caps = _json_loads(row["capabilities"]) if row else []
+        await self._fetch(
+            "UPDATE nodes SET capabilities = $1 WHERE id = $2",
             _json_dumps(caps), node_id,
         )
-        if row is None or not self._on_capability_change:
-            return
-        old_caps = _json_loads(row["old_caps"])
-        # Fire unconditionally on a successful write, exactly like the
-        # SQLite store (which does not diff-gate), with the true
-        # predecessor and the stored successor.
-        try:
-            self._on_capability_change(node_id, old_caps, caps)
-        except Exception:
-            pass
+        if self._on_capability_change:
+            try:
+                self._on_capability_change(node_id, old_caps, caps)
+            except Exception:
+                pass
 
     async def update_max_concurrent(self, node_id: str, max_concurrent: int) -> None:
         await self._fetch(
