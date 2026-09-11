@@ -305,7 +305,7 @@ SCHEMAS = {
             "properties": {
                 "title": {"type": "string", "description": "Task title/description"},
                 "requires": {"type": "array", "items": {"type": "string"}, "description": "Required capabilities"},
-                "priority": {"type": "integer", "description": "Priority (1=highest, 5=lowest)", "default": 3},
+                "priority": {"type": "integer", "description": "Priority band, ascending sort: 0=most urgent, 1..5 documented bands (default 3)", "default": 3},
             },
             "required": ["title"],
         },
