@@ -255,11 +255,13 @@ def test_reap_ignores_tmp_older_than_this_delivery(tmp_path):
     assert resolved and resolved[0][2] == "done"
 
 
-def test_transcript_alone_never_masquerades_as_deliverable(tmp_path):
+def test_transcript_promotion_is_never_a_plain_done(tmp_path):
     """rc=0, deliverable absent, stdout log full of transcript: must NOT be
-    done, must NOT auto-copy the transcript into result.md (the !23 trap:
-    per-section 'Verdict: CORRECT' lines in a truncated stdout read as a
-    pass). Surfaced as lost_deliverable pointing at the transcript."""
+    done (#868's !23 trap stands — the promotion is only allowed as the
+    VISIBLE transcript_promoted outcome, never as a verdict-grade done).
+    #871 supersedes the pre-fix expectation of lost_deliverable here: this is
+    exactly the shape of the two diligent !280 reviewer lanes that were
+    falsely FAILED; the fix promotes with a loud marker."""
     executor = _executor(worker="hermes", working_dir=str(tmp_path))
     results_dir = tmp_path / "hermes-results"
     results_dir.mkdir(parents=True)
@@ -277,11 +279,17 @@ def test_transcript_alone_never_masquerades_as_deliverable(tmp_path):
     executor._reap_hermes_spawn("task_868e", spawn, 60.0, resolved)
     assert resolved
     outcome, detail = resolved[0][2], resolved[0][3]
-    assert outcome != "done"
-    assert outcome == "lost_deliverable"
-    assert "stdout" in detail.lower()
-    # The transcript was left where it is; no silent promotion to deliverable.
-    assert not (results_dir / "task_868e.result.md").exists()
+    assert outcome != "done", (
+        "#868: a promoted transcript is NOT a lane verdict — it may never "
+        "resolve as plain done"
+    )
+    assert outcome == "transcript_promoted", (
+        "#871: transcript-only + rc=0 must NOT reap as a failure either"
+    )
+    # The promotion is VISIBLE and machine-checkable in the deliverable itself.
+    promoted = (results_dir / "task_868e.result.md").read_text(encoding="utf-8")
+    assert "TRANSCRIPT-PROMOTED" in promoted.splitlines()[0]
+    assert "some startup warnings" in promoted
 
 
 def test_spawn_cleans_prior_delivery_files(monkeypatch, tmp_path):
