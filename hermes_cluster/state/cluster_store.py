@@ -117,7 +117,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     updated_at TEXT,
     version INTEGER DEFAULT 0,
     fail_reason TEXT,
-    attempts INTEGER DEFAULT 0
+    attempts INTEGER DEFAULT 0,
+    result TEXT
 );
 
 -- Stateful lanes: one row per lane_key, keyed to the hermes session it owns.
@@ -318,6 +319,7 @@ class ClusterStore:
         for table, column, ddl in (
             ("tasks", "lane_key", "ALTER TABLE tasks ADD COLUMN lane_key TEXT DEFAULT ''"),
             ("tasks", "role", "ALTER TABLE tasks ADD COLUMN role TEXT DEFAULT 'author'"),
+            ("tasks", "result", "ALTER TABLE tasks ADD COLUMN result TEXT"),
             ("task_spawns", "lane_key", "ALTER TABLE task_spawns ADD COLUMN lane_key TEXT DEFAULT ''"),
             ("task_spawns", "role", "ALTER TABLE task_spawns ADD COLUMN role TEXT DEFAULT 'author'"),
             ("task_spawns", "session_id", "ALTER TABLE task_spawns ADD COLUMN session_id TEXT DEFAULT ''"),
@@ -557,6 +559,24 @@ class ClusterStore:
             rows = self._conn.execute("SELECT * FROM tasks").fetchall()
         return [self._row_to_task(r) for r in rows]
 
+    def set_task_result(self, task_id: str, result: Optional[str]) -> bool:
+        """Persist a lane's deliverable on the task row (#874).
+
+        Separate from set_task_status so a result can be recorded without
+        touching the state machine, and so an empty/None result is a no-op
+        rather than an overwrite of something already stored.
+        """
+        if result is None or not str(result).strip():
+            return False
+        now = datetime.utcnow()
+        with self._tx() as conn:
+            cur = conn.execute(
+                """UPDATE tasks SET result = ?, updated_at = ?, version = version + 1
+                   WHERE id = ?""",
+                (str(result), _dt_to_str(now), task_id),
+            )
+        return cur.rowcount > 0
+
     def set_task_status(
         self, task_id: str, status: TaskStatus, fail_reason: str = ""
     ) -> bool:
@@ -753,6 +773,7 @@ class ClusterStore:
             updated_at=_str_to_dt(row["updated_at"]),
             version=row["version"],
             fail_reason=row["fail_reason"],
+            result=(row["result"] if "result" in row.keys() else None),
             attempts=attempts,
             lane_key=lane_key,
             role=role,

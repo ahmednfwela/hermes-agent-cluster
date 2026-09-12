@@ -136,6 +136,13 @@ class Task(BaseModel):
     attempts: int = 0
     lane_key: str = ""  # stateful lane identity; empty = per-task session
     role: str = "author"  # "author" (profile default model) | "reviewer" (opus tier)
+    # #874: the lane's DELIVERABLE, carried on the task row so it survives the
+    # node that produced it. Before this, a result was written to
+    # <that node's working_dir>/hermes-results/<id>.result.md and `/complete`
+    # posted an empty {} -- so a verdict produced on one machine was
+    # unreadable from every other, and "produced nothing" was
+    # indistinguishable from "produced something unreachable".
+    result: Optional[str] = None
 
     model_config = {"populate_by_name": True}
 
@@ -710,6 +717,16 @@ class SubmitTaskRequest(BaseModel):
     priority: Optional[int] = Field(default=None, ge=0, le=5)
     lane_key: str = ""  # stateful lane identity (e.g. "shared/claude-plugins#feat/x")
     role: str = "author"  # "author" | "reviewer"
+
+
+class CompleteTaskRequest(BaseModel):
+    """Body for POST /tasks/{id}/complete (#874).
+
+    Optional so existing callers that post no body keep working; when present
+    the deliverable is persisted on the task row and becomes readable from any
+    node, not just the one that ran the lane.
+    """
+    result: Optional[str] = None
 
 
 class FailTaskRequest(BaseModel):

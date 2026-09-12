@@ -221,6 +221,26 @@ class ClusterState:
         with self._tasks_lock:
             return list(self._tasks.values())
 
+    def set_task_result(self, task_id: str, result: Optional[str]) -> bool:
+        """Record a lane's deliverable on the task (#874). Returns True if stored.
+
+        Deliberately separate from set_task_status: a result can be recorded
+        without touching the state machine, and a blank result is a no-op rather
+        than an overwrite. Blank matters -- #870's old success gate was
+        `contents.strip()`, where any non-whitespace byte counted as a
+        deliverable; the inverse must hold here.
+        """
+        if result is None or not str(result).strip():
+            return False
+        with self._tasks_lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                return False
+            task.result = str(result)
+            task.updated_at = datetime.utcnow()
+            task.version += 1
+            return True
+
     def set_task_status(self, task_id: str, status: TaskStatus, fail_reason: str = "") -> bool:
         """Set task status. Returns True on success.
 
