@@ -67,34 +67,60 @@ def test_a_ready_task_is_rescheduled_when_the_main_restarts(db):
 
 
 def test_startup_reschedule_does_not_run_on_a_worker(db):
-    """Workers do not schedule; only the main may promote work."""
+    """Workers do not schedule; only the main may promote work.
+
+    Asserts the NEGATIVE, not merely that the worker boots: a worker that
+    booted fine while also scheduling would satisfy a health check and still
+    be wrong.
+    """
     with _client(db) as main:
         _register_worker(main)
-        main.post("/api/v1/tasks", json={"title": "t", "requires": ["tooling"]})
-    # A worker booting against the same store must not crash or schedule.
+        tid = main.post(
+            "/api/v1/tasks", json={"title": "t", "requires": ["tooling"]}
+        ).json()["id"]
+
     with _client(db, node_role="worker") as worker:
         assert worker.get("/health").json()["role"] == "worker"
+        task = worker.get(f"/api/v1/tasks/{tid}").json()
+        assert task["status"] == "ready" and not task.get("assigned_to"), (
+            "a worker scheduled work: the node_role guard did not hold"
+        )
 
 
 def test_startup_reschedule_never_prevents_boot(db, monkeypatch):
     """A scheduling hiccup must not stop the server starting.
 
     An unscheduled queue is recoverable; a main that refuses to boot is not.
+
+    The patch target matters and a previous version of this test got it wrong:
+    it patched ``ClusterState``, but ``create_app`` builds a ``ClusterStore``
+    when ``db_path`` is set (app.py:144), and ``ClusterStore`` does NOT inherit
+    from ``ClusterState`` (cluster_store.py:248 — no base class). The patch was
+    inert, the real method ran and succeeded, and the test passed WITHOUT ever
+    exercising the ``except`` path it exists to cover.
+
+    So this version patches the class actually in use AND asserts the fault was
+    really injected, which is what stops the same false positive returning.
     """
-    import hermes_cluster.app as app_mod
+    from hermes_cluster.state.cluster_store import ClusterStore
 
     with _client(db) as first:
         _register_worker(first)
         first.post("/api/v1/tasks", json={"title": "t", "requires": ["tooling"]})
 
-    real = app_mod.ClusterState.trigger_pending_tasks
+    called = {"n": 0}
 
     def boom(self, *a, **k):
+        called["n"] += 1
         raise RuntimeError("scheduler exploded")
 
-    monkeypatch.setattr(app_mod.ClusterState, "trigger_pending_tasks", boom)
-    try:
-        with _client(db) as c:
-            assert c.get("/health").status_code == 200, "boot must survive"
-    finally:
-        monkeypatch.setattr(app_mod.ClusterState, "trigger_pending_tasks", real)
+    monkeypatch.setattr(ClusterStore, "trigger_pending_tasks", boom)
+
+    with _client(db) as c:
+        assert c.get("/health").status_code == 200, "boot must survive a scheduling fault"
+
+    assert called["n"] > 0, (
+        "the fault was never injected — the startup hook did not call "
+        "trigger_pending_tasks on ClusterStore, so the except path is untested "
+        "and this test is a false positive"
+    )

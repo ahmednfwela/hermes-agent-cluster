@@ -334,6 +334,11 @@ def create_app(
         """
         if node_role != "main":
             return
+        # Sync store calls inside an async handler: acceptable HERE because
+        # startup runs before the server accepts any request, so there is no
+        # concurrency to block. Moving this to a different lifecycle point
+        # (a periodic sweep, a request hook) would need a thread or an async
+        # store path instead.
         try:
             promoted = state.trigger_pending_tasks()
             assignments = state.schedule_pending_detailed()
