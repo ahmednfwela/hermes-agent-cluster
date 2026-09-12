@@ -116,7 +116,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     created_at TEXT,
     updated_at TEXT,
     version INTEGER DEFAULT 0,
-    fail_reason TEXT
+    fail_reason TEXT,
+    attempts INTEGER DEFAULT 0
 );
 
 -- Stateful lanes: one row per lane_key, keyed to the hermes session it owns.
@@ -223,7 +224,8 @@ CREATE TABLE IF NOT EXISTS task_spawns (
     result_path TEXT DEFAULT '',
     lane_key TEXT DEFAULT '',
     role TEXT DEFAULT 'author',
-    session_id TEXT DEFAULT ''
+    session_id TEXT DEFAULT '',
+    attempt INTEGER DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
@@ -319,6 +321,10 @@ class ClusterStore:
             ("task_spawns", "lane_key", "ALTER TABLE task_spawns ADD COLUMN lane_key TEXT DEFAULT ''"),
             ("task_spawns", "role", "ALTER TABLE task_spawns ADD COLUMN role TEXT DEFAULT 'author'"),
             ("task_spawns", "session_id", "ALTER TABLE task_spawns ADD COLUMN session_id TEXT DEFAULT ''"),
+            # #870: main-side retry cap — re-queue counter, and the delivery
+            # count carried on the spawn record.
+            ("tasks", "attempts", "ALTER TABLE tasks ADD COLUMN attempts INTEGER DEFAULT 0"),
+            ("task_spawns", "attempt", "ALTER TABLE task_spawns ADD COLUMN attempt INTEGER DEFAULT 0"),
         ):
             try:
                 cols = [r[1] for r in self._conn.execute(f"PRAGMA table_info({table})")]
@@ -609,6 +615,42 @@ class ClusterStore:
             )
             return result.rowcount > 0
 
+    def requeue_task(self, task_id: str, reason: str = "") -> bool:
+        """#870: return a task to 'ready' for another delivery attempt after
+        a worker reported a NON-DELIVERABLE result body. Atomic guarded
+        UPDATE mirrors unassign_task (terminal tasks never revive) and adds
+        the cap check + attempts bump in the same statement. The task's
+        active leases are revoked first — the delivery is over and the
+        live-lease guard would otherwise refuse the un-assign.
+
+        Returns True when the task was actually re-queued.
+        """
+        now = datetime.utcnow()
+        limit = int(getattr(self, "task_retry_limit", 3))
+        terminal_ids = [s.value for s in TERMINAL_TASK_STATUSES]
+        placeholders = ",".join("?" for _ in terminal_ids)
+        # revoke live leases for this task before the guarded update (same
+        # status/expiry predicate as get_active_leases' marking).
+        with self._tx() as conn:
+            conn.execute(
+                f"""UPDATE leases SET status = ?
+                    WHERE task_id = ? AND status = ? AND expires_at > ?""",
+                (LeaseStatus.revoked.value, task_id,
+                 LeaseStatus.active.value, _dt_to_str(now)),
+            )
+            result = conn.execute(
+                f"""UPDATE tasks
+                    SET status = ?, assigned_to = NULL, updated_at = ?,
+                        version = version + 1, attempts = attempts + 1,
+                        fail_reason = COALESCE(?, fail_reason)
+                    WHERE id = ?
+                      AND status NOT IN ({placeholders})
+                      AND COALESCE(attempts, 0) < ?""",
+                (TaskStatus.ready.value, _dt_to_str(now),
+                 reason or None, task_id, *terminal_ids, limit),
+            )
+            return result.rowcount > 0
+
     def set_dependencies(self, task_id: str, depends_on: List[str]) -> bool:
         now = datetime.utcnow()
         with self._tx() as conn:
@@ -695,6 +737,10 @@ class ClusterStore:
             role = row["role"]
         except (KeyError, IndexError):
             role = "author"
+        try:
+            attempts = int(row["attempts"] or 0)
+        except (KeyError, IndexError, TypeError, ValueError):
+            attempts = 0
         return Task(
             id=row["id"],
             title=row["title"],
@@ -707,6 +753,7 @@ class ClusterStore:
             updated_at=_str_to_dt(row["updated_at"]),
             version=row["version"],
             fail_reason=row["fail_reason"],
+            attempts=attempts,
             lane_key=lane_key,
             role=role,
         )
@@ -1316,16 +1363,17 @@ class ClusterStore:
         lane_key: str = "",
         role: str = "author",
         session_id: str = "",
+        attempt: int = 0,
     ) -> None:
         """Persist a task spawn record (upsert by task_id)."""
         with self._tx() as conn:
             conn.execute(
                 """INSERT OR REPLACE INTO task_spawns
                    (task_id, mode, job_id, pid, started_at, lease_id, lane_name,
-                    result_path, lane_key, role, session_id)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    result_path, lane_key, role, session_id, attempt)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (task_id, mode, job_id, pid, started_at, lease_id, lane_name,
-                 result_path, lane_key, role, session_id),
+                 result_path, lane_key, role, session_id, attempt),
             )
 
     def get_task_spawn(self, task_id: str) -> Optional[dict]:

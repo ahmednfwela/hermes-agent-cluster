@@ -296,6 +296,39 @@ class ClusterState:
                 return True
             return False
 
+    def requeue_task(self, task_id: str, reason: str = "") -> bool:
+        """#870: a delivery whose result body was not a deliverable — the
+        task returns to ``ready`` for another attempt instead of being
+        consumed as ``failed``. The reporting worker's lease is revoked
+        first (its claim is over), assigned_to is cleared, and ``attempts``
+        is bumped — main owns the counter so the retry cap survives executor
+        restarts and node handoffs. Terminal tasks are never revived (B1
+        invariant holds; the caller checks the cap BEFORE asking for this).
+
+        Returns True when the task was actually re-queued.
+        """
+        with self._tasks_lock:
+            if task_id not in self._tasks:
+                return False
+            task = self._tasks[task_id]
+            if task.status in TERMINAL_TASK_STATUSES:
+                return False
+            if task.attempts >= getattr(self, "task_retry_limit", 3):
+                return False
+            task.attempts += 1
+            task.assigned_to = None
+            task.status = TaskStatus.ready
+            task.updated_at = datetime.utcnow()
+            task.version += 1
+            if reason:
+                task.fail_reason = reason
+        # Lease revocation outside the tasks lock (own lock) — same
+        # ordering every other lease caller uses.
+        lease = self.get_lease_by_task(task_id)
+        if lease:
+            self.revoke_lease(lease.id)
+        return True
+
     def set_dependencies(self, task_id: str, depends_on: List[str]) -> bool:
         with self._tasks_lock:
             if task_id not in self._tasks:
@@ -790,6 +823,7 @@ class ClusterState:
         lane_key: str = "",
         role: str = "author",
         session_id: str = "",
+        attempt: int = 0,
     ) -> None:
         """Persist a task spawn record (in-memory mirror of ClusterStore)."""
         with self._task_spawns_lock:
@@ -805,6 +839,7 @@ class ClusterState:
                 "lane_key": lane_key,
                 "role": role,
                 "session_id": session_id,
+                "attempt": attempt,
             }
 
     def get_task_spawn(self, task_id: str) -> Optional[dict]:

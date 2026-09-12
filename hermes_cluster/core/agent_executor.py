@@ -67,6 +67,8 @@ from typing import Dict, List, Optional
 from urllib.request import Request, urlopen
 from urllib.error import URLError
 
+from .deliverable_guard import classify_non_deliverable, has_no_turn_stderr
+
 
 def _npx_bin() -> str:
     """Resolve the npx launcher for subprocess.Popen without a shell.
@@ -76,6 +78,18 @@ def _npx_bin() -> str:
     Node is on PATH. shutil.which applies PATHEXT and returns the real file.
     """
     return shutil.which("npx") or "npx"
+
+
+def _record_attempt(record: dict) -> int:
+    """#870: the delivery count carried by a persisted spawn record.
+
+    Tolerates pre-#870 records (column absent/NULL) and non-integer junk —
+    a reconcile of an old record must not crash the executor start.
+    """
+    try:
+        return max(0, int(record.get("attempt") or 0))
+    except (TypeError, ValueError):
+        return 0
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +121,13 @@ class AgentExecutorConfig:
     # accepts their verdicts; author lanes use the profile default (no -m).
     hermes_reviewer_model: str = "qwen3.7-plus"
     bdaya_dispatch_package: str = "@shared/bdaya-dispatch@latest"
+    # #870: deliveries main may re-queue after the reap rejects a
+    # NON-DELIVERABLE result body (provider error / echoed brief) before the
+    # task is consumed as failed. 3 = two recovery chances after the first
+    # rejection: enough to clear a transient provider blip (the fleet hit
+    # two in one evening), small enough that a genuinely broken brief cannot
+    # burn a node's quota looping.
+    retry_limit: int = 3
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +157,10 @@ class ActiveSpawn:
     miss_count: int = 0  # consecutive polls where lane was absent from status
     spawn_exit_rc: Optional[int] = None  # set once spawn process exits
     spawn_exit_stderr: str = ""  # captured stderr tail on nonzero exit
+    # #870: count of PRIOR deliveries of this task observed at spawn time
+    # (from the persisted record; main's task.attempts is the authority).
+    # Rides through persistence so an executor restart cannot reset it.
+    attempt: int = 0
 
 
 class _ResumedProcess:
@@ -940,6 +965,7 @@ class AgentExecutor:
             role=role,
             session_id=resume_session_id,
             resumed=bool(resume_session_id),
+            attempt=self._prior_attempt(task_id, task),
         )
 
         with self._lock:
@@ -973,6 +999,7 @@ class AgentExecutor:
                 lane_key=spawn.lane_key,
                 role=spawn.role,
                 session_id=spawn.session_id,
+                attempt=spawn.attempt,
             )
             # Reflect the lane in the stateful-lanes table whenever a lane_key
             # exists (session_id filled in later, on reap, from stderr).
@@ -1046,6 +1073,7 @@ class AgentExecutor:
                     lane_name=record.get("lane_name") or f"hermes-{task_id}",
                     mode=record.get("mode") or "bdaya-dispatch",
                     result_path=record.get("result_path") or "",
+                    attempt=_record_attempt(record),
                     stdout_path=(
                         str(self._hermes_stdout_path(task_id))
                         if record.get("mode") == "hermes"
@@ -1233,8 +1261,109 @@ class AgentExecutor:
                 # distinction is not lost: result.md carries a loud marker
                 # and the executor logs a warning (see _write_promoted_result).
                 self._report_completion(task_id, detail=detail)
+            elif outcome == "non_deliverable":
+                # #870: the result body was NOT a deliverable (provider/
+                # transport error or an echo of the dispatched brief). The
+                # task must not be consumed — re-queue under the cap so a
+                # genuinely broken brief cannot loop forever. The attempt
+                # count rides the spawn (authoritative across executor
+                # restarts via the persisted record) — it is read BEFORE
+                # _drop_persisted_spawn cleared the store row.
+                self._requeue_task(
+                    task_id, outcome, f"lane {spawn.lane_name}: {detail}",
+                    attempt=spawn.attempt,
+                )
             else:
                 self._report_failure(task_id, f"lane {spawn.lane_name}: {detail}")
+
+    # -------------------------------------------------------------------
+    # Deliverable-content guard (#870)
+    # -------------------------------------------------------------------
+
+    def _brief_text_for(self, task_id: str) -> str:
+        """The dispatched brief the executor itself wrote for this task.
+
+        ``_write_brief`` puts it at ``<working_dir>/hermes-briefs/<task>.md``
+        and it is deterministic from task fields; a retry rebuilds the same
+        text. Absent (bdaya mode, pruned dir) → '' so the echo rule no-ops
+        rather than guessing.
+        """
+        path = (
+            Path(self._config.working_dir or ".") / "hermes-briefs"
+            / f"{task_id}.md"
+        )
+        try:
+            return path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+
+    def _prior_attempt(self, task_id: str, task: Optional[dict] = None) -> int:
+        """Deliveries already re-queued for this task (the cap's numerator).
+
+        Authority is main's own counter: the scheduler hands the task dict
+        around (GET /api/v1/tasks) and the router bumps ``attempts`` on every
+        re-queued /fail, so it survives executor restarts and is shared
+        across nodes. Fallback (key absent — an older main predating the
+        field): the persisted spawn record left from an earlier delivery.
+        No record → 0.
+        """
+        if task is not None and "attempts" in task:
+            try:
+                return max(0, int(task["attempts"]))
+            except (TypeError, ValueError):
+                pass
+        store = getattr(self, "_store", None)
+        if store is None:
+            return 0
+        try:
+            record = store.get_task_spawn(task_id)
+        except Exception:
+            record = None
+        try:
+            return int((record or {}).get("attempt") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _requeue_task(self, task_id: str, reason: str, detail: str,
+                      attempt: int = 0) -> None:
+        """Tell main this delivery failed as a non-deliverable (#870).
+
+        Same endpoint as a plain failure (POST /fail) with ``requeue=true``:
+        under the retry cap main resets the task to ready for another
+        delivery; at/over the cap it consumes the task as failed so a
+        genuinely broken brief cannot loop. The cap lives on the MAIN node —
+        the scheduler's source of truth — so the count survives executor
+        restarts and is authoritative across nodes; the executor sends the
+        attempt it observed only as a courtesy, never as the authority.
+        """
+        limit = int(getattr(self._config, "retry_limit", 3))
+        will_exceed = attempt >= limit
+        body = {"reason": f"{reason}: {detail}"[:2000], "requeue": not will_exceed}
+        result = _signed_request(
+            self._cluster_endpoint,
+            "POST",
+            f"/api/v1/tasks/{task_id}/fail",
+            body,
+            self._token,
+            self._node_id,
+        )
+        if result:
+            if will_exceed or not result.get("requeued", False):
+                logger.error(
+                    "task %s consumed as failed (%s, attempt %d, cap %d): %s",
+                    task_id, reason, attempt + 1, limit, detail[:200],
+                )
+            else:
+                logger.warning(
+                    "task %s re-queued (attempt %d/%d, %s): %s",
+                    task_id, attempt + 1, limit, reason, detail[:200],
+                )
+        else:
+            logger.error(
+                "failed to report non-deliverable for task %s (%s) — the "
+                "task will be retried after its lease expires",
+                task_id, reason,
+            )
 
     def _reap_hermes_spawn(
         self,
@@ -1313,6 +1442,48 @@ class AgentExecutor:
             except OSError:
                 contents = ""
             if contents.strip():
+                # #870: non-empty is NOT sufficient — two production shapes
+                # rode this exact gate to a fabricated 'completed': a
+                # provider/transport error body and the dispatched brief
+                # echoed back (a reviewer lane — an unreviewed MR passes a
+                # gate that trusts the status word). The classifier is
+                # conservative by design: a real deliverable may quote its
+                # brief and may say the word "error".
+                stderr_text = self._read_spawn_stderr(spawn) or ""
+                reason = classify_non_deliverable(
+                    contents,
+                    self._brief_text_for(task_id),
+                    is_error_response=("API failed after" in stderr_text),
+                )
+                if reason:
+                    no_turn = has_no_turn_stderr(stderr_text)
+                    detail = (
+                        f"result body is not a deliverable ({reason}"
+                        + ("; agent produced no turn — session restored zero "
+                           "messages" if no_turn else "")
+                        + f"): {contents.strip()[:200]!r}"
+                    )
+                    logger.error(
+                        "#870 false-completed guard fired: task %s (%s) — "
+                        "reaping as %s, never 'done'",
+                        task_id, reason, "non_deliverable",
+                    )
+                    resolved.append((task_id, spawn, "non_deliverable", detail))
+                    return
+                if has_no_turn_stderr(stderr_text):
+                    # The body passed the guards but the resumed session
+                    # restored ZERO messages — the lane answered without its
+                    # prior context (#870 R2-1 class). Deliverable wins over
+                    # veto (a fresh execution of the same query can be real
+                    # work — vetoing here would reject good lanes), but the
+                    # consumer must not read the status word blind.
+                    logger.warning(
+                        "task %s: deliverable accepted but stderr shows "
+                        "'found but has no messages' — the resumed session "
+                        "had no history; verify the body used the right "
+                        "lane context",
+                        task_id,
+                    )
                 resolved.append((
                     task_id, spawn, "done",
                     f"hermes result written in {elapsed:.0f}s ({spawn.result_path})",

@@ -1,6 +1,10 @@
 """Task management endpoints — /api/v1/tasks"""
 
+import logging
+
 from fastapi import APIRouter, HTTPException, Request
+
+logger = logging.getLogger(__name__)
 
 from ..models import (
     DEFAULT_PRIORITY,
@@ -107,6 +111,32 @@ async def fail_task(task_id: str, req: FailTaskRequest = None):
     if task.status == TaskStatus.cancel_requested:
         _state.set_task_status(task_id, TaskStatus.cancelled, fail_reason=reason)
         return {"status": "cancelled", "blocked": []}
+
+    # #870: a worker reporting a NON-DELIVERABLE result body (provider error
+    # / echoed brief) asks for a re-queue instead of consumption. Main owns
+    # the retry cap — requeue_task bumps `attempts` and returns the task to
+    # ready atomically, refusing at/over the cap; on refusal (or a terminal
+    # task) we fall through to the consuming failure below, so the cap is
+    # enforced in exactly one place: the store's guarded UPDATE.
+    if req and getattr(req, "requeue", False):
+        requeued = False
+        try:
+            requeued = _state.requeue_task(task_id, reason=reason)
+        except Exception:
+            logger.exception("requeue_task failed for %s — consuming instead",
+                             task_id)
+        if requeued:
+            # Mirror the recovery rescheduler: the queue gets an immediate
+            # chance to re-place the task without waiting for an external
+            # /schedule/trigger (the whole point of re-queueing is that the
+            # work continues). Best-effort: the task stays `ready` either
+            # way and a later trigger still picks it up.
+            try:
+                _state.schedule_pending()
+            except Exception:
+                logger.exception("schedule_pending after requeue of %s failed",
+                                 task_id)
+            return {"status": "requeued", "requeued": True, "reason": reason}
 
     # N2 fix: revoke lease on /fail (same as /complete does)
     if _lease_manager:
