@@ -10,8 +10,10 @@ polls every 30s. Configure endpoint via `GITLAB_INTAKE_ENDPOINT` env var
 (default: https://gitlab.bdaya-dev.com) and project via `GITLAB_INTAKE_PROJECT`
 (default: shared%2Fclaude-plugins).
 
-All ingested tasks carry `requires: ["tooling"]` and a title prefixed with the
-issue iid (e.g., `[#123] Issue title`).
+All ingested tasks carry `requires: ["tooling"]` (override with
+`GITLAB_INTAKE_REQUIRES`, comma-separated) and a title prefixed with the
+issue iid (e.g., `[#123] Issue title`). This is deliberately INDEPENDENT of
+`GITLAB_INTAKE_LABEL`, which only filters which issues are ingested — see #873.
 
 Webhook authentication: set `GITLAB_INTAKE_WEBHOOK_SECRET` to validate the
 `X-Gitlab-Token` header. When unset, the webhook accepts any POST (logs a warning).
@@ -172,6 +174,20 @@ async def status():
 # Issue → task mapping
 # ---------------------------------------------------------------------------
 
+def _intake_requires() -> list[str]:
+    """Capability a task from this path REQUIRES — not the ingest filter label.
+
+    The label selects WHICH issues to ingest; ``requires`` selects WHICH worker
+    may claim the resulting task. Conflating them mints a requirement no node
+    advertises, and the task sits ``ready`` forever with nothing to surface it
+    (#873: with GITLAB_INTAKE_LABEL=hermes-factory, this path had never once
+    produced a claimable task).
+    """
+    return [r for r in (
+        x.strip() for x in os.environ.get("GITLAB_INTAKE_REQUIRES", "tooling").split(",")
+    ) if r]
+
+
 def _create_task_from_issue(
     issue_iid: int,
     title: str,
@@ -192,7 +208,7 @@ def _create_task_from_issue(
     task = _state.create_task(
         task_id=task_id,
         title=f"[#{issue_iid}] {title}",
-        requires=[label],
+        requires=_intake_requires(),
         priority=3,
     )
     _issue_iid_to_task_id[issue_iid] = task_id
