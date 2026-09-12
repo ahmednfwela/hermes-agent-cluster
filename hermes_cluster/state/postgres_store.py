@@ -132,7 +132,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     fail_reason TEXT,
     attempts INTEGER DEFAULT 0,
     lane_key TEXT DEFAULT '',
-    role TEXT DEFAULT 'author'
+    role TEXT DEFAULT 'author',
+    result TEXT
 );
 
 -- Stateful lanes: one row per lane_key, keyed to the hermes session it owns.
@@ -345,6 +346,9 @@ class PostgresClusterStore:
             # the main-side re-queue counter and the per-spawn delivery count.
             await conn.execute(
                 "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS attempts INTEGER DEFAULT 0")
+            # #874: the lane deliverable, so a result outlives the node that made it.
+            await conn.execute(
+                "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS result TEXT")
             await conn.execute(
                 "ALTER TABLE task_spawns ADD COLUMN IF NOT EXISTS attempt INTEGER DEFAULT 0")
         logger.info("PostgresClusterStore: connected, schema ensured")
@@ -615,6 +619,18 @@ class PostgresClusterStore:
         rows = await self._all("SELECT * FROM tasks")
         return [self._row_to_task(r) for r in rows]
 
+    async def set_task_result(self, task_id: str, result: Optional[str]) -> bool:
+        """Persist a lane's deliverable on the task row (#874). No-op on empty."""
+        if result is None or not str(result).strip():
+            return False
+        async with self._pool.acquire() as conn:
+            res = await conn.execute(
+                """UPDATE tasks SET result = $1, updated_at = $2, version = version + 1
+                   WHERE id = $3""",
+                str(result), datetime.now(timezone.utc), task_id,
+            )
+        return res.endswith("1")
+
     async def set_task_status(
         self, task_id: str, status: TaskStatus, fail_reason: str = ""
     ) -> bool:
@@ -781,6 +797,7 @@ class PostgresClusterStore:
             updated_at=updated.replace(tzinfo=None) if updated.tzinfo else updated,
             version=row["version"],
             fail_reason=row["fail_reason"],
+            result=(row["result"] if "result" in row else None),
             attempts=int(row["attempts"] or 0) if "attempts" in row.keys() else 0,
             lane_key=row["lane_key"] or "",
             role=row["role"] or "author",

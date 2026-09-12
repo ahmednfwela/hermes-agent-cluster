@@ -1,6 +1,7 @@
 """Task management endpoints — /api/v1/tasks"""
 
 import logging
+from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Request
 
@@ -9,6 +10,7 @@ logger = logging.getLogger(__name__)
 from ..models import (
     DEFAULT_PRIORITY,
     SubmitTaskRequest,
+    CompleteTaskRequest,
     FailTaskRequest,
     CancelTaskRequest,
     SetDependenciesRequest,
@@ -61,8 +63,29 @@ async def list_tasks():
     return _state.get_all_tasks()
 
 
+@router.get("/{task_id}")
+async def get_task(task_id: str):
+    """Read ONE task, including its deliverable (#874).
+
+    Until now the only read path was the full listing -- so fetching a single
+    lane's result meant pulling every task in the cluster and filtering client
+    side, and the lead had no per-task read at all. Retrievability is the whole
+    point of #874; a result you cannot address is barely stored.
+    """
+    task = _state.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="task not found")
+    return task
+
+
 @router.post("/{task_id}/complete")
-async def complete_task(task_id: str):
+async def complete_task(task_id: str, req: Optional[CompleteTaskRequest] = None):
+    """Close a task, optionally carrying its deliverable (#874).
+
+    `req` is optional so callers that post no body keep working unchanged. When
+    a result IS supplied it is stored on the task row, which is what makes a
+    lane's output readable from a node other than the one that produced it.
+    """
     task = _state.get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="task not found")
@@ -86,10 +109,16 @@ async def complete_task(task_id: str):
         _state.set_task_status(task_id, TaskStatus.cancelled, fail_reason="cancelled")
         return {"status": "cancelled"}
 
+    # Record the deliverable BEFORE the status flip, so a reader that sees
+    # `completed` never sees it without the result that completion refers to.
+    stored = False
+    if req is not None and req.result is not None:
+        stored = _state.set_task_result(task_id, req.result)
+
     _state.set_task_status(task_id, TaskStatus.completed)
     # Auto-transition downstream tasks
     _trigger_downstream(task_id)
-    return {"status": "completed"}
+    return {"status": "completed", "result_stored": stored}
 
 
 @router.post("/{task_id}/fail")
