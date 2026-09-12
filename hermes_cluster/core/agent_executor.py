@@ -63,7 +63,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from urllib.request import Request, urlopen
 from urllib.error import URLError
 
@@ -1260,7 +1260,9 @@ class AgentExecutor:
                 # fix: no false failure, no re-dispatch loop. The
                 # distinction is not lost: result.md carries a loud marker
                 # and the executor logs a warning (see _write_promoted_result).
-                self._report_completion(task_id, detail=detail)
+                self._report_completion(
+                    task_id, detail=detail, result=self._read_result_body(spawn)
+                )
             elif outcome == "non_deliverable":
                 # #870: the result body was NOT a deliverable (provider/
                 # transport error or an echo of the dispatched brief). The
@@ -1853,20 +1855,68 @@ class AgentExecutor:
     # Reporting results back to the cluster
     # -------------------------------------------------------------------
 
-    def _report_completion(self, task_id: str, detail: str = "") -> None:
-        """Mark a task as completed on the main node."""
-        result = _signed_request(
+    # #874: cap on the deliverable carried over the wire. A result is normally
+    # a verdict or a short report; anything past this is a transcript dump, and
+    # the tail is the part that matters (verdict lines land at the end), so the
+    # HEAD is dropped and the truncation is announced in-band.
+    RESULT_BODY_MAX_BYTES = 256 * 1024
+
+    def _read_result_body(self, spawn: Any) -> Optional[str]:
+        """The lane's deliverable, for transport to the main node (#874).
+
+        Returns None when there is nothing worth carrying. Never raises: a
+        completion must not fail because a result file is unreadable -- losing
+        the body is bad, losing the completion is worse.
+        """
+        path = getattr(spawn, "result_path", "") or ""
+        if not path:
+            return None
+        try:
+            body = Path(path).read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            logger.warning("could not read result body at %s: %s", path, exc)
+            return None
+        if not body.strip():
+            return None
+        raw = body.encode("utf-8")
+        if len(raw) > self.RESULT_BODY_MAX_BYTES:
+            kept = raw[-self.RESULT_BODY_MAX_BYTES:].decode("utf-8", errors="replace")
+            logger.warning(
+                "result body truncated for transport: task result at %s is %d bytes",
+                path, len(raw),
+            )
+            return (
+                f"[truncated: {len(raw)} bytes, kept the last "
+                f"{self.RESULT_BODY_MAX_BYTES}]" + chr(10) + kept
+            )
+        return body
+
+    def _report_completion(
+        self, task_id: str, detail: str = "", result: Optional[str] = None
+    ) -> None:
+        """Mark a task as completed on the main node, carrying its deliverable.
+
+        #874: this used to POST an empty {} and discard `detail`, so a result
+        lived only on the local disk of whichever node ran the lane -- a verdict
+        produced on one machine was unreadable from every other.
+        """
+        payload = {"result": result} if result else {}
+        result_ok = _signed_request(
             self._cluster_endpoint,
             "POST",
             f"/api/v1/tasks/{task_id}/complete",
-            {},
+            payload,
             self._token,
             self._node_id,
         )
-        if result:
-            logger.info("task %s marked completed: %s", task_id, detail or "ok")
+        if result_ok:
+            logger.info(
+                'task %s marked completed: %s (result: %s)',
+                task_id, detail or 'ok',
+                f'{len(result)} chars carried' if result else 'none',
+            )
         else:
-            logger.error("failed to mark task %s completed", task_id)
+            logger.error('failed to mark task %s completed', task_id)
 
     def _report_failure(self, task_id: str, reason: str) -> None:
         """Mark a task as failed on the main node."""

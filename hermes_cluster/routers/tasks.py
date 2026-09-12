@@ -1,6 +1,8 @@
 """Task management endpoints — /api/v1/tasks"""
 
 import logging
+import re
+from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Request
 
@@ -9,6 +11,7 @@ logger = logging.getLogger(__name__)
 from ..models import (
     DEFAULT_PRIORITY,
     SubmitTaskRequest,
+    CompleteTaskRequest,
     FailTaskRequest,
     CancelTaskRequest,
     SetDependenciesRequest,
@@ -35,8 +38,48 @@ def _generate_task_id() -> str:
     return "task_" + secrets.token_hex(8)
 
 
+def _lane_target(lane_key: str):
+    """The PR/MR or issue number a lane_key names, if it names one (#872).
+
+    `infra-github!274-rev-b` -> "274".  `claude-plugins!912-rev2` -> "912".
+    A branch-shaped key like `claude-plugins#feat/869-seat-by-paste` names no
+    number (the segment after # is not digits) and returns None -- those lanes
+    carry no target to disagree with.
+    """
+    m = re.search(r"[!#](\d+)", lane_key or "")
+    return m.group(1) if m else None
+
+
+def _brief_names_target(title: str, target: str) -> bool:
+    """True if the brief mentions the target as a NUMBER, not a substring.
+
+    Bounded so "274" is not satisfied by "1274" or "2740" -- an unbounded match
+    would let a brief about a different PR pass while appearing to guard.
+    """
+    return re.search(r"(?<!\d)" + re.escape(target) + r"(?!\d)", title or "") is not None
+
+
 @router.post("")
 async def submit_task(req: SubmitTaskRequest):
+    # #872: a task's `title` IS its brief -- the schema has no description
+    # column. On 2026-09-12 the authoring path wrote one task's brief verbatim
+    # into another task's title: the reviewer lane for PR#274 received an
+    # IMPLEMENTATION brief naming no PR at all. The lane did exactly as asked
+    # and posted nothing; the lead read `completed` with no verdict, concluded
+    # the result was lost, and paid for a re-review plus a 13-agent diagnosis.
+    # There was never a lost verdict -- only a brief that did not match its lane.
+    target = _lane_target(req.lane_key)
+    if target and not _brief_names_target(req.title, target):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"brief/target disagreement (#872): lane_key {req.lane_key!r} "
+                f"names target {target}, but the title -- which IS the brief -- "
+                f"never mentions it. The lane would run the wrong job and report "
+                f"completed. Fix the brief, or the lane_key."
+            ),
+        )
+
     task_id = _generate_task_id()
     # Default only when the caller said nothing (None). 0 is a legal band —
     # the top one — and must survive to the store untouched (#866). Range
@@ -61,8 +104,29 @@ async def list_tasks():
     return _state.get_all_tasks()
 
 
+@router.get("/{task_id}")
+async def get_task(task_id: str):
+    """Read ONE task, including its deliverable (#874).
+
+    Until now the only read path was the full listing -- so fetching a single
+    lane's result meant pulling every task in the cluster and filtering client
+    side, and the lead had no per-task read at all. Retrievability is the whole
+    point of #874; a result you cannot address is barely stored.
+    """
+    task = _state.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="task not found")
+    return task
+
+
 @router.post("/{task_id}/complete")
-async def complete_task(task_id: str):
+async def complete_task(task_id: str, req: Optional[CompleteTaskRequest] = None):
+    """Close a task, optionally carrying its deliverable (#874).
+
+    `req` is optional so callers that post no body keep working unchanged. When
+    a result IS supplied it is stored on the task row, which is what makes a
+    lane's output readable from a node other than the one that produced it.
+    """
     task = _state.get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="task not found")
@@ -86,10 +150,16 @@ async def complete_task(task_id: str):
         _state.set_task_status(task_id, TaskStatus.cancelled, fail_reason="cancelled")
         return {"status": "cancelled"}
 
+    # Record the deliverable BEFORE the status flip, so a reader that sees
+    # `completed` never sees it without the result that completion refers to.
+    stored = False
+    if req is not None and req.result is not None:
+        stored = _state.set_task_result(task_id, req.result)
+
     _state.set_task_status(task_id, TaskStatus.completed)
     # Auto-transition downstream tasks
     _trigger_downstream(task_id)
-    return {"status": "completed"}
+    return {"status": "completed", "result_stored": stored}
 
 
 @router.post("/{task_id}/fail")
