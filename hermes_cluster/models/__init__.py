@@ -129,6 +129,11 @@ class Task(BaseModel):
     updated_at: datetime = Field(default_factory=datetime.utcnow)
     version: int = 0
     fail_reason: Optional[str] = None
+    # #870: deliveries re-queued back to this node after a non-deliverable
+    # result (provider error / echoed brief). The retry cap lives HERE — on
+    # main, the scheduler's source of truth — so an executor restart or a
+    # node handoff cannot reset it. Bumped on every requeue=true /fail.
+    attempts: int = 0
     lane_key: str = ""  # stateful lane identity; empty = per-task session
     role: str = "author"  # "author" (profile default model) | "reviewer" (opus tier)
 
@@ -709,6 +714,12 @@ class SubmitTaskRequest(BaseModel):
 
 class FailTaskRequest(BaseModel):
     reason: str = "failed"
+    # #870: set by a worker reporting a NON-DELIVERABLE result body (provider
+    # error / echoed brief — see agent_executor.deliverable_guard). Under
+    # main's retry cap the task goes back to ready (attempts bumped) instead
+    # of being consumed as failed; at/over the cap main falls back to the
+    # consuming failure. Never set by plain failure callers.
+    requeue: bool = False
 
 
 class CancelTaskRequest(BaseModel):

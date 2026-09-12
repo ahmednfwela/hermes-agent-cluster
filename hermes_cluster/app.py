@@ -228,6 +228,7 @@ def create_app(
                 hermes_profile=ae_cfg_dict.get("hermes_profile", "default"),
                 hermes_bin=ae_cfg_dict.get("hermes_bin", ""),
                 hermes_reviewer_model=ae_cfg_dict.get("hermes_reviewer_model", "qwen3.7-plus"),
+                retry_limit=int(ae_cfg_dict.get("retry_limit", 3)),
             )
             _agent_executor = AgentExecutor(
                 config=ae_cfg,

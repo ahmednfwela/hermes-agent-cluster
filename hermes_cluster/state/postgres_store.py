@@ -130,6 +130,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     updated_at TIMESTAMPTZ,
     version INTEGER DEFAULT 0,
     fail_reason TEXT,
+    attempts INTEGER DEFAULT 0,
     lane_key TEXT DEFAULT '',
     role TEXT DEFAULT 'author'
 );
@@ -231,7 +232,8 @@ CREATE TABLE IF NOT EXISTS task_spawns (
     result_path TEXT DEFAULT '',
     lane_key TEXT DEFAULT '',
     role TEXT DEFAULT 'author',
-    session_id TEXT DEFAULT ''
+    session_id TEXT DEFAULT '',
+    attempt INTEGER DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
@@ -338,6 +340,13 @@ class PostgresClusterStore:
         self._pool = await asyncpg.create_pool(dsn=self._dsn, min_size=1, max_size=10)
         async with self._pool.acquire() as conn:
             await conn.execute(_SCHEMA_SQL)
+            # Idempotent column drift for databases created before #870
+            # (CREATE TABLE IF NOT EXISTS never touches an existing table):
+            # the main-side re-queue counter and the per-spawn delivery count.
+            await conn.execute(
+                "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS attempts INTEGER DEFAULT 0")
+            await conn.execute(
+                "ALTER TABLE task_spawns ADD COLUMN IF NOT EXISTS attempt INTEGER DEFAULT 0")
         logger.info("PostgresClusterStore: connected, schema ensured")
         return self
 
@@ -654,6 +663,38 @@ class PostgresClusterStore:
         )
         return n > 0
 
+    async def requeue_task(self, task_id: str, reason: str = "") -> bool:
+        """#870: return a task to 'ready' for another delivery attempt after
+        a worker reported a NON-DELIVERABLE result body. Mirrors the SQLite
+        store: lease revocation + guarded UPDATE in ONE transaction (the
+        guarded UPDATE carries the terminal check and the attempts<cap check
+        atomically, so two racing reporters cannot both requeue past the cap).
+
+        Returns True when the task was actually re-queued.
+        """
+        limit = int(getattr(self, "task_retry_limit", 3))
+        now = _utcnow()
+        terminal_ids = [s.value for s in TERMINAL_TASK_STATUSES]
+        async with self._txn() as conn:
+            await conn.execute(
+                """UPDATE leases SET status = $1
+                   WHERE task_id = $2 AND status = $3 AND expires_at > $4""",
+                LeaseStatus.revoked.value, task_id,
+                LeaseStatus.active.value, now,
+            )
+            status = await conn.execute(
+                """UPDATE tasks
+                   SET status = $1, assigned_to = NULL, updated_at = $2,
+                       version = version + 1, attempts = COALESCE(attempts, 0) + 1,
+                       fail_reason = COALESCE($5, fail_reason)
+                   WHERE id = $3
+                     AND status <> ALL($4::text[])
+                     AND COALESCE(attempts, 0) < $6""",
+                TaskStatus.ready.value, now, task_id, terminal_ids,
+                reason or None, limit,
+            )
+        return status != "UPDATE 0"
+
     async def set_dependencies(self, task_id: str, depends_on: List[str]) -> bool:
         now = _utcnow()
         async with self._txn() as conn:
@@ -740,6 +781,7 @@ class PostgresClusterStore:
             updated_at=updated.replace(tzinfo=None) if updated.tzinfo else updated,
             version=row["version"],
             fail_reason=row["fail_reason"],
+            attempts=int(row["attempts"] or 0) if "attempts" in row.keys() else 0,
             lane_key=row["lane_key"] or "",
             role=row["role"] or "author",
         )
@@ -1294,20 +1336,22 @@ class PostgresClusterStore:
         lane_key: str = "",
         role: str = "author",
         session_id: str = "",
+        attempt: int = 0,
     ) -> None:
         await self._fetch(
             """INSERT INTO task_spawns
                (task_id, mode, job_id, pid, started_at, lease_id, lane_name,
-                result_path, lane_key, role, session_id)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                result_path, lane_key, role, session_id, attempt)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
                ON CONFLICT (task_id) DO UPDATE SET
                  mode = EXCLUDED.mode, job_id = EXCLUDED.job_id,
                  pid = EXCLUDED.pid, started_at = EXCLUDED.started_at,
                  lease_id = EXCLUDED.lease_id, lane_name = EXCLUDED.lane_name,
                  result_path = EXCLUDED.result_path, lane_key = EXCLUDED.lane_key,
-                 role = EXCLUDED.role, session_id = EXCLUDED.session_id""",
+                 role = EXCLUDED.role, session_id = EXCLUDED.session_id,
+                 attempt = EXCLUDED.attempt""",
             task_id, mode, job_id, pid, started_at, lease_id, lane_name,
-            result_path, lane_key, role, session_id,
+            result_path, lane_key, role, session_id, attempt,
         )
 
     async def get_task_spawn(self, task_id: str) -> Optional[dict]:
