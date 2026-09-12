@@ -59,6 +59,70 @@ def _brief_names_target(title: str, target: str) -> bool:
     return re.search(r"(?<!\d)" + re.escape(target) + r"(?!\d)", title or "") is not None
 
 
+# A TARGET REF is a number written in a shape that means "this PR/MR/issue":
+#   `#274`, `!274`, `pr#275`, `MR 275`, `gh pr comment 273`, `work item !912`.
+# Deliberately NOT every bare number in the brief (line counts, budgets, head
+# SHAs) -- only references with target-referrer tokens, so the guard stays
+# usable for real briefs while still catching a mis-copied target.
+_TARGET_REF = re.compile(
+    r"""
+      [!#]\s*(\d+)                                    # gitlab-style: !274 / #872
+    | \b(?:pr|mr|merge\s+request|issue|work\s+item)s?\b   # a referrer token
+      (?:\s*[!#])?\s*(?:[A-Za-z_]{1,12}\s+)?          # optional !/# + one action word
+      (\d+)                                           # the number it aims at
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _foreign_target_refs(title: str, target: str) -> list:
+    """Target-ref numbers named in the brief that are NOT the lane's target.
+
+    #872's second instance: lane `infra-github!275-rev-c` got a brief that
+    named pr#275 (so the presence check passed) but instructed the lane to
+    `gh pr comment 273` -- the wrong PR. The lane overrode its own brief and
+    guessed right; a lane guessing at its target is luck, not a control.
+    Any foreign target ref means the brief and the lane disagree about WHICH
+    work item this delivery is about, which is the whole defect.
+    """
+    found = set()
+    for m in _TARGET_REF.finditer(title or ""):
+        num = m.group(1) or m.group(2)
+        if num and num != target:
+            found.add(num)
+    return sorted(found)
+
+
+# An ACTION reference: a posting/reviewing verb with a bounded target number
+# attached -- "gh pr comment 273", "review PR#274", "post the verdict to 275",
+# "merge 273". Verb-only mentions ("NEVER approve or merge") carry no number
+# and match nothing. Bare cross-references WITHOUT a verb (`Refs #872`) are
+# context, not the job instruction, so they are deliberately NOT captured --
+# flagging them would false-reject ordinary reviewer briefs.
+_ACTION_REF_RE = re.compile(
+    r"(?i)\b(?:"
+    r"(?:gh\s+)?pr\s+comment"
+    r"|comment\s+on"
+    r"|post\s+(?:the\s+\w+\s+)?(?:to|on|in)"
+    r"|review(?:ed)?(?:\s+(?:the\s+)?(?:pr|mr|issue))?"
+    r"|verdict\s+(?:on|for)"
+    r"|(?:merge|close)(?:d)?\s+(?:the\s+)?(?:pr|mr|issue)?"
+    r")\s*#?\s*(\d+)(?!\d)"
+)
+
+
+def _brief_action_targets(title: str) -> set:
+    """Every bounded number the brief attaches to a posting/reviewing verb.
+
+    Instance 2 of #872: a brief for the PR#275 lane told the lane to
+    `gh pr comment 273`. The mention-check alone accepted it -- the title
+    DID mention 275 -- and only the lane's own override saved the verdict.
+    A brief whose ACTION names a different target than the lane does is the
+    same defect: the lane is being asked to do the wrong job.
+    """
+    return set(_ACTION_REF_RE.findall(title or ""))
+
+
 @router.post("")
 async def submit_task(req: SubmitTaskRequest):
     # #872: a task's `title` IS its brief -- the schema has no description
@@ -79,6 +143,26 @@ async def submit_task(req: SubmitTaskRequest):
                 f"completed. Fix the brief, or the lane_key."
             ),
         )
+    # Instance 2 of #872: the brief MENTIONED its target (275) while
+    # instructing `gh pr comment 273`. A mention-only check accepted it; only
+    # the lane overriding its own brief saved that verdict. If the brief's
+    # ACTION names a different number than the lane does, reject too -- but
+    # only when the target is absent from the action set entirely, so a brief
+    # that reviews 275 and cross-references 273 stays legal.
+    if target:
+        actions = _brief_action_targets(req.title)
+        if actions and target not in actions:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"brief/action disagreement (#872 instance 2): lane_key "
+                    f"{req.lane_key!r} names target {target}, but the title's "
+                    f"posting/reviewing instruction(s) name only "
+                    f"{sorted(actions)}. The lane would post its verdict to the "
+                    f"wrong PR -- or silently override its own brief and get "
+                    f"lucky. Fix the brief."
+                ),
+            )
 
     task_id = _generate_task_id()
     # Default only when the caller said nothing (None). 0 is a legal band —

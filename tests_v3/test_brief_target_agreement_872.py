@@ -111,3 +111,60 @@ def test_issue_shaped_lane_keys_are_checked_too(client):
         json={"title": "review !912 at head 420e4bc3", "lane_key": "claude-plugins!912-rev2"},
     )
     assert good.status_code == 200, good.text
+
+
+# --- instance 2 of the issue: the ACTION names a different target -----------
+
+# Verbatim shape of task_f4c0e3d70e522f93's brief: it mentions its own target
+# (so the guard above passes) while instructing `gh pr comment 273` -- the
+# WRONG PR. The 275 lane silently overrode its own instruction and posted to
+# 275. A lane correcting its brief is luck, not a control.
+_INSTANCE_2_BRIEF = (
+    "REVIEW-ONLY lane for pr#275. Post your verdict with "
+    "`gh pr comment 273 --repo Bdaya-Dev/infra-github --body-file v.md`. "
+    "NEVER approve or merge."
+)
+
+
+def test_the_275_comment_273_incident_is_rejected(client):
+    """Instance 2: brief mentions the lane target but instructs a wrong-PR action."""
+    r = client.post(
+        "/api/v1/tasks",
+        json={"title": _INSTANCE_2_BRIEF, "lane_key": "infra-github!275-rev-c"},
+    )
+    assert r.status_code == 422, (
+        "instance 2 escaped: a brief whose ACTION (`gh pr comment 273`) names a "
+        "different PR than the lane (275) was accepted -- the lane would post the "
+        "verdict to the wrong PR, or override its own brief and get lucky"
+    )
+    assert "275" in r.json()["detail"]
+    assert "273" in r.json()["detail"], "the rejection should name the offending number"
+
+
+def test_action_mentioning_the_own_target_is_accepted(client):
+    """The corrected instance-2 brief (comment on 275) must pass."""
+    r = client.post(
+        "/api/v1/tasks",
+        json={
+            "title": _INSTANCE_2_BRIEF.replace("273", "275"),
+            "lane_key": "infra-github!275-rev-c",
+        },
+    )
+    assert r.status_code == 200, r.text
+
+
+def test_action_target_extraction_is_verb_bounded():
+    """Only verb-attached numbers count as the job's action target.
+
+    `NEVER approve or merge` (no number) must not trigger, and a bare
+    cross-reference like `Refs #872` is context, not an instruction --
+    false-rejecting those would block ordinary reviewer briefs.
+    """
+    from hermes_cluster.routers.tasks import _brief_action_targets
+
+    assert _brief_action_targets(_INSTANCE_2_BRIEF) == {"273"}
+    assert _brief_action_targets(_WRONG_BRIEF) == set()          # verbs, no numbers
+    assert _brief_action_targets("REVIEW-ONLY - review PR#274 at head 85a9b382f") == {"274"}
+    assert "872" not in _brief_action_targets("fix per Refs #872")
+    assert _brief_action_targets("post the verdict to 275") == {"275"}
+    assert _brief_action_targets("reviewed 128, merged 129") == {"128", "129"}
