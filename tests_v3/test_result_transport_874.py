@@ -100,3 +100,57 @@ def test_result_survives_a_task_listing(client):
     listed = [t for t in client.get("/api/v1/tasks").json() if t["id"] == tid]
     assert listed, "task vanished from the listing"
     assert listed[0]["result"] == "from-the-list"
+
+
+# ---------------------------------------------------------------------------
+# Executor half: the deliverable must actually be SENT, not just storable.
+# ---------------------------------------------------------------------------
+
+def _executor():
+    """A bare AgentExecutor instance, no scheduler or cluster attached."""
+    from hermes_cluster.core.agent_executor import AgentExecutor
+    return AgentExecutor.__new__(AgentExecutor)
+
+
+class _Spawn:
+    def __init__(self, result_path):
+        self.result_path = str(result_path)
+
+
+def test_read_result_body_returns_the_deliverable(tmp_path):
+    f = tmp_path / "r.md"
+    f.write_text("Reviewer verdict: PASS\nSHA: abc123", encoding="utf-8")
+    assert _executor()._read_result_body(_Spawn(f)) == "Reviewer verdict: PASS\nSHA: abc123"
+
+
+def test_read_result_body_is_none_when_there_is_nothing_to_carry(tmp_path):
+    """Blank, absent and path-less all mean 'no deliverable' -- never a crash."""
+    ex = _executor()
+    blank = tmp_path / "blank.md"
+    blank.write_text("   \n\t\n", encoding="utf-8")
+    assert ex._read_result_body(_Spawn(blank)) is None
+    assert ex._read_result_body(_Spawn(tmp_path / "does-not-exist.md")) is None
+    assert ex._read_result_body(_Spawn("")) is None
+
+
+def test_read_result_body_keeps_the_TAIL_when_truncating(tmp_path):
+    """Verdict lines land at the END, so truncation must drop the head.
+
+    Keeping the head would discard exactly the part a reader needs.
+    """
+    ex = _executor()
+    cap = ex.RESULT_BODY_MAX_BYTES
+    f = tmp_path / "big.md"
+    f.write_text("x" * (cap + 5000) + "\nReviewer verdict: PASS", encoding="utf-8")
+    body = ex._read_result_body(_Spawn(f))
+    assert body is not None
+    assert body.startswith("[truncated:"), "truncation must be announced in-band"
+    assert body.rstrip().endswith("Reviewer verdict: PASS"), "the tail was dropped"
+
+
+def test_unreadable_result_never_breaks_the_completion(tmp_path):
+    """Losing the body is bad; losing the completion is worse."""
+    ex = _executor()
+    d = tmp_path / "a-directory-not-a-file"
+    d.mkdir()
+    assert ex._read_result_body(_Spawn(d)) is None
