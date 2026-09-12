@@ -16,7 +16,12 @@ Two spawn modes (config ``agent_executor.worker``; default ``bdaya-dispatch``):
     transcript) and ``<task>.result.md`` is left FREE for the lane to write
     its deliverable into — the executor never opens it (shared/claude-plugins
     #868: holding the deliverable path open made Windows refuse the lane's
-    tmp-then-rename write and silently stranded whole verdicts).
+    tmp-then-rename write and silently stranded whole verdicts). Lanes,
+    however, deliver by PRINTING their final message; when one exits 0 with
+    no result.md and a non-empty transcript, the executor promotes the
+    transcript into result.md under a loud marker and reaps
+    ``transcript_promoted`` — completion without a verdict-grade ``done``
+    (shared/claude-plugins#871).
 
 Restart safety (#804 note 132791): the task→lane map is persisted in the
 ClusterStore SQLite (``task_spawns`` table) and reconciled on start — a lane
@@ -56,6 +61,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional
 from urllib.request import Request, urlopen
@@ -455,8 +461,19 @@ class AgentExecutor:
         description: str,
         lane_key: str = "",
         role: str = "author",
+        deliverable_path: str = "",
     ) -> Path:
-        """Write the per-task brief file the guarded worker lane reads."""
+        """Write the per-task brief file the guarded worker lane reads.
+
+        ``deliverable_path`` (hermes mode) makes the #868/#871 delivery
+        contract EXPLICIT at the one place every lane is guaranteed to read:
+        printing the final message is NOT delivery — the lane must WRITE this
+        exact file before exiting. (#871: lanes deliver by printing; two
+        diligent reviewer lanes in a row did exactly that and were recorded
+        FAILED. The executor's transcript fallback catches that now, but the
+        contract is stated here so a compliant lane reaps a plain 'done',
+        not a marker-stamped promotion a merge gate must refuse.)
+        """
         d = Path(self._config.working_dir or ".") / "hermes-briefs"
         d.mkdir(parents=True, exist_ok=True)
         path = d / f"{task_id}.md"
@@ -486,6 +503,19 @@ class AgentExecutor:
             "- When done, state exactly what you produced (files, MR links, proof) in your final message.",
             "",
         ]
+        if deliverable_path:
+            lines += [
+                "### Delivery contract (cluster executor)",
+                f"- Your deliverable is the file `{deliverable_path}`. WRITE it "
+                "explicitly with write_file before you exit — your printed final "
+                "message is NOT auto-captured there (shared/claude-plugins#868).",
+                "- If you exit 0 without writing it, the executor promotes your "
+                "stdout transcript into that file under a visible marker and the "
+                "task completes as TRANSCRIPT-PROMOTED — never a plain done, and "
+                "a merge gate will refuse to treat it as a verdict "
+                "(shared/claude-plugins#871). Write the file; it is one call.",
+                "",
+            ]
         path.write_text(chr(10).join(lines), encoding="utf-8")
         return path
 
@@ -680,6 +710,54 @@ class AgentExecutor:
                 continue
         return out
 
+    # Marker line stamped at the top of a promoted result.md (#871). Loud for
+    # humans, exact for machines: a merge gate can grep the first line and
+    # refuse to treat the file as a verdict. Keep in sync with tests.
+    PROMOTION_MARKER = (
+        "<!-- TRANSCRIPT-PROMOTED: the executor copied this from the child's "
+        "stdout; the lane did not write a deliverable. NOT a verdict-grade "
+        "result (shared/claude-plugins#871). -->"
+    )
+
+    def _write_promoted_result(
+        self, result_path: Path, stdout_path: Path,
+        task_id: str, transcript_text: str,
+    ) -> bool:
+        """Promote a transcript into the deliverable path, VISIBLY (#871).
+
+        Writes marker + provenance + the transcript bytes to ``result_path``
+        via tmp-then-rename — the same mechanism the lane itself uses, and
+        safe on Windows because after #868 the executor holds no handle on
+        result.md. Returns False on any OSError; the caller must then surface
+        the loss loudly, never silently.
+        """
+        body = (
+            f"{self.PROMOTION_MARKER}\n"
+            f"<!-- promoted_from: {stdout_path} task: {task_id} "
+            f"promoted_at: {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')} -->\n\n"
+            f"{transcript_text}"
+        )
+        tmp = result_path.with_name(f".hermes-promoted-tmp.{task_id}")
+        try:
+            result_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(body, encoding="utf-8")
+            try:
+                os.replace(tmp, result_path)
+            except OSError:
+                # Windows refuses a rename over a path a live process holds
+                # open (the #868 mechanic). The lane may have exited leaving
+                # the path to another writer — direct open('w') still lands
+                # the promotion on POSIX and anywhere the path is merely
+                # locked-but-writable; if THAT fails too the loss is real.
+                try:
+                    result_path.write_text(body, encoding="utf-8")
+                finally:
+                    self._remove_quiet(tmp)
+            return True
+        except OSError:
+            self._remove_quiet(tmp)
+            return False
+
 
     def _hermes_stderr_path(self, task_id: str) -> Path:
         """Directory/log file where a native hermes lane's stderr is captured.
@@ -739,13 +817,14 @@ class AgentExecutor:
         role = task.get("role", "author") or "author"
 
         lane_name = f"hermes-{task_id}"
-        brief_path = self._write_brief(
-            task_id, task_title, task.get("description") or "",
-            lane_key=lane_key, role=role,
-        )
         result_path = self._hermes_result_path(task_id)
         stdout_path = self._hermes_stdout_path(task_id)
         stderr_path = self._hermes_stderr_path(task_id)
+        brief_path = self._write_brief(
+            task_id, task_title, task.get("description") or "",
+            lane_key=lane_key, role=role,
+            deliverable_path=str(result_path),
+        )
 
         # Spawn-time cleanup of a PREVIOUS delivery's files (#868): the result
         # check below is content-based, so a stale result.md from an earlier
@@ -1136,15 +1215,23 @@ class AgentExecutor:
                 self._active_spawns.pop(task_id, None)
             # Stateful lane: capture the hermes session id from this delivery's
             # stderr into the lanes table BEFORE the record is dropped, so the
-            # next task with the same lane_key resumes that session.
-            if outcome == "done" and spawn.mode == "hermes":
+            # next task with the same lane_key resumes that session. A
+            # promoted delivery is still a real, completed turn — the next
+            # brief must resume the same session, so it gets the same care
+            # (#871).
+            if (outcome in ("done", "transcript_promoted")
+                    and spawn.mode == "hermes"):
                 self._touch_lane_from_spawn(spawn, task_id)
             # A terminal lane's persisted record is dropped so a future run of
             # the same task may spawn again; an active lane's record survives
             # restarts and blocks a duplicate spawn.
             self._drop_persisted_spawn(task_id)
 
-            if outcome == "done":
+            if outcome in ("done", "transcript_promoted"):
+                # A promoted transcript COMPLETES the task — that is the #871
+                # fix: no false failure, no re-dispatch loop. The
+                # distinction is not lost: result.md carries a loud marker
+                # and the executor logs a warning (see _write_promoted_result).
                 self._report_completion(task_id, detail=detail)
             else:
                 self._report_failure(task_id, f"lane {spawn.lane_name}: {detail}")
@@ -1160,7 +1247,11 @@ class AgentExecutor:
 
         Completion contract (hermes ``chat --query-file ... -Q``):
           - RC 0 and a non-empty result file → done
-          - RC 0 without a result file → fail (agent produced nothing)
+          - RC 0 without a result file but with a non-empty transcript and no
+            stranded tmp → transcript_promoted (the transcript is copied into
+            result.md under a loud marker — completes the task but is never a
+            verdict-grade done; shared/claude-plugins#871)
+          - RC 0 with nothing to deliver → fail (agent produced nothing)
           - RC != 0 → fail with captured stderr tail
           - still running → keep waiting (bounded by spawn_timeout)
         A resumed spawn (executor restarted mid-task) drives completion off the
@@ -1236,22 +1327,66 @@ class AgentExecutor:
             return
 
         if rc is not None and rc == 0:
-            # Exited cleanly with no deliverable. When a non-empty transcript
-            # exists this must NOT be promoted to result.md (#868's !23 trap:
-            # stdout's per-section "Verdict: CORRECT" lines read as a pass
-            # while the real NEEDS-CHANGES verdict stranded elsewhere) —
-            # surface it as a lost deliverable pointing at the transcript.
-            has_transcript = False
+            # Exited cleanly with no deliverable. Lanes deliver by PRINTING
+            # their final message; pre-#868 that print WAS result.md (the
+            # inherited-stdout handle), so it reaped done. Post-#868 the print
+            # lands in stdout.log and result.md must be written explicitly —
+            # and diligent lanes were reaping a false FAILURE (the #871
+            # specimens: two live verdicts posted to !280, both recorded
+            # FAILED, feeding an unbounded re-dispatch loop).
+            #
+            # So the transcript is promoted to the deliverable — but NEVER
+            # silently. #868's refusal still governs the !23 trap (a truncated
+            # transcript whose per-section "Verdict: CORRECT" lines read as a
+            # pass): (a) a stranded .hermes-tmp.* was already surfaced above
+            # as lost_deliverable and returns before ever reaching here; (b)
+            # promotion writes a loud machine-checkable header marker into
+            # result.md; and (c) the outcome is ``transcript_promoted``, never
+            # plain ``done`` — a merge gate can and must refuse to treat it
+            # as a verdict (shared/claude-plugins#871).
+            transcript_text = ""
             if getattr(spawn, "stdout_path", ""):
                 try:
-                    has_transcript = (
-                        Path(spawn.stdout_path).is_file()
-                        and bool(Path(spawn.stdout_path).read_text(
-                            encoding="utf-8", errors="replace").strip())
-                    )
+                    if Path(spawn.stdout_path).is_file():
+                        transcript_text = Path(spawn.stdout_path).read_text(
+                            encoding="utf-8", errors="replace"
+                        )
                 except OSError:
-                    has_transcript = False
-            if has_transcript:
+                    transcript_text = ""
+            if transcript_text.strip() and spawn.result_path:
+                marker_written = self._write_promoted_result(
+                    Path(spawn.result_path), Path(spawn.stdout_path),
+                    task_id, transcript_text,
+                )
+                if marker_written:
+                    resolved.append((
+                        task_id, spawn, "transcript_promoted",
+                        f"hermes exited rc=0 after {elapsed:.0f}s without "
+                        f"writing {spawn.result_path}; the executor PROMOTED "
+                        f"the transcript at {spawn.stdout_path} into it with "
+                        f"a visible marker — outcome transcript_promoted, NOT "
+                        f"a lane verdict (shared/claude-plugins#871)",
+                    ))
+                    logger.warning(
+                        "task %s: transcript promoted to deliverable "
+                        "(lane printed its final message instead of writing "
+                        "result.md) — NOT a verdict-grade 'done' (#871)",
+                        task_id,
+                    )
+                    return
+                # Promotion itself failed (e.g. path held by another live
+                # writer): fall through to the loud lost-deliverable surface —
+                # silent loss is still the bug #868 exists to prevent.
+                resolved.append((
+                    task_id, spawn, "lost_deliverable",
+                    f"hermes exited rc=0 after {elapsed:.0f}s but wrote no "
+                    f"deliverable at {spawn.result_path} and the transcript "
+                    f"promotion write FAILED; transcript at "
+                    f"{spawn.stdout_path} — do NOT treat it as the verdict "
+                    f"(shared/claude-plugins#868 #871)",
+                ))
+                return
+            if transcript_text.strip():
                 resolved.append((
                     task_id, spawn, "lost_deliverable",
                     f"hermes exited rc=0 after {elapsed:.0f}s but wrote no "
