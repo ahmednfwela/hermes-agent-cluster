@@ -59,6 +59,38 @@ def _brief_names_target(title: str, target: str) -> bool:
     return re.search(r"(?<!\d)" + re.escape(target) + r"(?!\d)", title or "") is not None
 
 
+# Posting/review COMMANDS where the lane is told WHERE to act: the number that
+# follows the verb IS the target as far as the lane is concerned. A second
+# instance of the #872 defect was a brief for PR#275 instructing
+# `gh pr comment 273` -- the lane overrode its own instruction and posted to
+# 275; a lane correcting its brief is luck, not a control.
+_POSTING_REF_RE = re.compile(
+    r"\b(?:gh|glab)\s+(?:pr|mr|issue)\s+"
+    r"(?:comment|review|close|merge|edit|approve|ready)\s+#?(\d+)",
+    re.IGNORECASE,
+)
+
+
+def _posting_refs(brief: str) -> list:
+    """Numbers the brief binds an ACTION to -- `gh pr comment 273`.
+
+    Deliberately narrow: bare `#NNN` MENTIONS are not captured. Briefs
+    legitimately cross-reference other issues (`Refs #872.`) and a mention
+    does not tell the lane where to act; only a CLI posting command does,
+    and that is exactly the form instance 2 of #872 got wrong.
+    """
+    return _POSTING_REF_RE.findall(brief or "")
+
+
+def _posting_ref_mismatches(brief: str, target: str) -> list:
+    """Action-bound numbers that disagree with the lane's target.
+
+    Bounded match (same rule as _brief_names_target): a ref of "27" does not
+    satisfy a target of "274" and IS a mismatch.
+    """
+    return [r for r in _posting_refs(brief) if not _brief_names_target(r, target)]
+
+
 @router.post("")
 async def submit_task(req: SubmitTaskRequest):
     # #872: a task's `title` IS its brief -- the schema has no description
@@ -79,6 +111,22 @@ async def submit_task(req: SubmitTaskRequest):
                 f"completed. Fix the brief, or the lane_key."
             ),
         )
+    # Instance 2 of #872: the brief named 275 correctly but told the lane to
+    # `gh pr comment 273`. A lane that silently overrides its own posting
+    # instruction is a bug that happened to be caught by luck; make it a 422.
+    if target:
+        mismatches = _posting_ref_mismatches(req.title, target)
+        if mismatches:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"brief/target disagreement (#872): lane_key {req.lane_key!r} "
+                    f"names target {target}, but the brief binds a posting "
+                    f"action to {', '.join(sorted(set(mismatches)))}. The lane "
+                    f"would post to the wrong target -- or override its own "
+                    f"brief. Fix the number in the brief, or the lane_key."
+                ),
+            )
 
     task_id = _generate_task_id()
     # Default only when the caller said nothing (None). 0 is a legal band —
