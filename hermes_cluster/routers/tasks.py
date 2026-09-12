@@ -1,6 +1,7 @@
 """Task management endpoints — /api/v1/tasks"""
 
 import logging
+import re
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Request
@@ -37,8 +38,48 @@ def _generate_task_id() -> str:
     return "task_" + secrets.token_hex(8)
 
 
+def _lane_target(lane_key: str):
+    """The PR/MR or issue number a lane_key names, if it names one (#872).
+
+    `infra-github!274-rev-b` -> "274".  `claude-plugins!912-rev2` -> "912".
+    A branch-shaped key like `claude-plugins#feat/869-seat-by-paste` names no
+    number (the segment after # is not digits) and returns None -- those lanes
+    carry no target to disagree with.
+    """
+    m = re.search(r"[!#](\d+)", lane_key or "")
+    return m.group(1) if m else None
+
+
+def _brief_names_target(title: str, target: str) -> bool:
+    """True if the brief mentions the target as a NUMBER, not a substring.
+
+    Bounded so "274" is not satisfied by "1274" or "2740" -- an unbounded match
+    would let a brief about a different PR pass while appearing to guard.
+    """
+    return re.search(r"(?<!\d)" + re.escape(target) + r"(?!\d)", title or "") is not None
+
+
 @router.post("")
 async def submit_task(req: SubmitTaskRequest):
+    # #872: a task's `title` IS its brief -- the schema has no description
+    # column. On 2026-09-12 the authoring path wrote one task's brief verbatim
+    # into another task's title: the reviewer lane for PR#274 received an
+    # IMPLEMENTATION brief naming no PR at all. The lane did exactly as asked
+    # and posted nothing; the lead read `completed` with no verdict, concluded
+    # the result was lost, and paid for a re-review plus a 13-agent diagnosis.
+    # There was never a lost verdict -- only a brief that did not match its lane.
+    target = _lane_target(req.lane_key)
+    if target and not _brief_names_target(req.title, target):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"brief/target disagreement (#872): lane_key {req.lane_key!r} "
+                f"names target {target}, but the title -- which IS the brief -- "
+                f"never mentions it. The lane would run the wrong job and report "
+                f"completed. Fix the brief, or the lane_key."
+            ),
+        )
+
     task_id = _generate_task_id()
     # Default only when the caller said nothing (None). 0 is a legal band —
     # the top one — and must survive to the store untouched (#866). Range
