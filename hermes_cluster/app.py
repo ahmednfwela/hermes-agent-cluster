@@ -305,6 +305,49 @@ def create_app(
             media_type="text/plain",
         )
 
+    # Startup handler — re-schedule anything left `ready` by the previous process
+    @app.on_event("startup")
+    async def reschedule_orphaned_ready_tasks():
+        """#878: a restart used to silently strand the entire queue.
+
+        Scheduling is driven purely by task-lifecycle events — task created,
+        capabilities updated, task completed. Each of those calls
+        ``trigger_pending_tasks()`` exactly once. A task that is still `ready`
+        when the process dies has therefore already spent its only trigger:
+        the new process loads it from the store, and nothing ever asks the
+        scheduler to look at it again. Node re-registration does NOT help —
+        the trigger in routers/nodes.py sits in ``update_capabilities``, not
+        in join or heartbeat.
+
+        Measured on the hosted main 2026-09-12: a task with
+        ``requires: ["tooling"]`` sat `ready` for over three minutes after a
+        pod restart with three workers online and idle at ``load 0.0``, with
+        zero rows written to ``scheduling_decisions``. One
+        ``POST /api/v1/schedule/trigger`` dispatched it in under 15 seconds.
+
+        This is worse in Kubernetes than it ever was on a desktop: a pod
+        restarts on any node drain, image bump or eviction, unattended, and
+        the failure is silent — no error, no `fail_reason`, `failed_schedules`
+        stays 0. The queue simply goes inert.
+
+        Workers do not schedule, so this runs on the main only.
+        """
+        if node_role != "main":
+            return
+        try:
+            promoted = state.trigger_pending_tasks()
+            assignments = state.schedule_pending_detailed()
+            if promoted or assignments:
+                logger.info(
+                    "startup reschedule: promoted=%s assigned=%s",
+                    promoted, len(assignments),
+                )
+        except Exception:
+            # A scheduling hiccup must never prevent the server from starting —
+            # an unscheduled queue is recoverable, a main that refuses to boot
+            # is not.
+            logger.exception("startup reschedule failed (continuing)")
+
     # Shutdown handler — stop all background threads
     @app.on_event("shutdown")
     async def shutdown():
